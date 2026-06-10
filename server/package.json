@@ -9,7 +9,9 @@
     "start": "node dist/index.js",
     "test": "vitest run --pool=forks --fileParallelism=false",
     "test:watch": "vitest",
-    "export-catalog": "tsx src/scripts/export-catalog.ts"
+    "export-catalog": "tsx src/scripts/export-catalog.ts",
+    "gen-test-license": "node scripts/generate-test-license.mjs",
+    "gen-test-license:annual": "node scripts/generate-test-license.mjs --annual"
   },
   "dependencies": {
     "@freellmapi/shared": "*",

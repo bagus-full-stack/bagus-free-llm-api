@@ -244,6 +244,64 @@ router stays fully self-hosted either way.
 Locally built apps launch without Gatekeeper/SmartScreen warnings — no code
 signing involved. Full instructions in [desktop/README.md](./desktop/README.md).
 
+### Testing Premium locally (development only)
+
+For development and testing, you can generate a test Premium license without leaving your local machine:
+
+**Option 1: Via UI button (Recommended)**
+```bash
+cd server && npm run dev
+# (in another terminal)
+cd client && npm run dev
+# Open http://localhost:5173 → Premium page → "Developer Tools" → button
+```
+
+**Option 2: Via CLI (faster)**
+```bash
+cd server
+npm run gen-test-license          # Lifetime (default)
+npm run gen-test-license:annual   # Annual (1 year)
+npm run dev
+# (in another terminal) cd client && npm run dev
+```
+
+Generated test keys are marked `fla_dev_*` and only work in development mode (`NODE_ENV !== 'production'`).
+
+**Verification**: On the Premium page, you should see:
+- 🟢 **Catalog feed**: "Live feed" (not "Monthly snapshot")
+- 🟢 **License**: Green badge "Premium Lifetime" (or "Premium Annual")
+- 🟢 **Last checked**: Recent timestamp
+
+**Implementation details**:
+- Route admin endpoint: `POST /api/premium/admin/generate-test-key` (dev-only)
+- Modified files: `server/src/routes/premium.ts`, `client/src/pages/PremiumPage.tsx`, `server/package.json`
+- New files: `server/scripts/generate-test-license.mjs` (CLI generator)
+
+**Security**:
+- ✅ Endpoint blocked in production (returns 403 if `NODE_ENV=production`)
+- ✅ Test keys clearly identified as dev keys (`fla_dev_` prefix)
+- ✅ UI button invisible in production
+- ✅ No external network calls; keys are completely local
+- ✅ Easy to reset: delete `server/data/freeapi.db` and regenerate
+
+**Scenarios**:
+| Scenario | How |
+|----------|-----|
+| Test UI Premium | Click button in interface |
+| Test live catalog sync | Click "Check for updates" |
+| Test Annual plan | `npm run gen-test-license:annual` |
+| Test Lifetime plan | `npm run gen-test-license` |
+| Remove test key | Premium page → "Remove key from this device" |
+| Reset everything | `rm -r server/data/freeapi.db*` then regenerate |
+| Test offline | Generate key, disconnect internet; catalog stays cached |
+
+**Troubleshooting**:
+- **No "Developer Tools" button**: Verify `NODE_ENV !== 'production'`; try hard refresh (`Ctrl+Shift+R`)
+- **Route returns 403**: You're in production mode; check `NODE_ENV`
+- **License doesn't activate**: Ensure you're authenticated to the dashboard; check browser console
+- **Catalog stays "Monthly snapshot"**: Click "Check for updates"; wait a few seconds; check server console for `[catalog-sync]` messages
+- **Key won't register**: Verify file permissions on `server/data/freeapi.db`; reset and retry
+
 ## Using the API
 
 Any OpenAI-compatible client works. Examples:

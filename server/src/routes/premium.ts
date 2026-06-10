@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
+import crypto from 'crypto';
 import { getSetting, setSetting, getDb } from '../db/index.js';
 import {
   SETTING_LICENSE_KEY,
@@ -122,5 +123,47 @@ premiumRouter.post('/portal', async (_req: Request, res: Response) => {
     res.json({ url: body.url });
   } catch {
     res.status(502).json({ error: 'Could not reach the billing service. Try again shortly.' });
+  }
+});
+
+/** POST /api/premium/admin/generate-test-key — DEV ONLY. Generate a test Premium license. */
+premiumRouter.post('/admin/generate-test-key', async (_req: Request, res: Response) => {
+  // IMPORTANT: This endpoint only works in development mode.
+  if (process.env.NODE_ENV === 'production') {
+    res.status(403).json({ error: 'This endpoint is not available in production.' });
+    return;
+  }
+
+  try {
+    // Generate a test key in format: fla_dev_<random>
+    const testKey = `fla_dev_${crypto.randomBytes(24).toString('hex')}`;
+
+    // Create a mock license status (lifetime for convenience)
+    const mockLicense = {
+      valid: true,
+      plan: 'lifetime' as const,
+      status: 'active',
+      expiresAt: null,
+      cancelAtPeriodEnd: false,
+      reason: null,
+      checkedAtMs: Date.now(),
+    };
+
+    // Store in settings
+    setSetting(SETTING_LICENSE_KEY, testKey);
+    setSetting(SETTING_LICENSE_STATUS, JSON.stringify(mockLicense));
+
+    // Trigger a catalog sync with the new test key
+    await syncCatalog(true);
+
+    // Return the new status
+    res.json({
+      ...statusPayload(),
+      message: '✅ Test Premium license generated. Use "Check for updates" to sync the live catalog.',
+      testKey,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: `Failed to generate test license: ${message}` });
   }
 });

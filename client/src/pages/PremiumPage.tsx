@@ -53,6 +53,8 @@ export default function PremiumPage() {
   const queryClient = useQueryClient()
   const [keyInput, setKeyInput] = useState('')
 
+  const isDev = import.meta.env.DEV
+
   const { data, isLoading } = useQuery<PremiumStatus>({
     queryKey: ['premium'],
     queryFn: () => apiFetch('/api/premium'),
@@ -88,6 +90,11 @@ export default function PremiumPage() {
     onSuccess: ({ url }) => {
       window.open(url, '_blank', 'noopener')
     },
+  })
+
+  const generateTestKey = useMutation({
+    mutationFn: () => apiFetch('/api/premium/admin/generate-test-key', { method: 'POST' }),
+    onSuccess: invalidate,
   })
 
   if (isLoading || !data) {
@@ -255,6 +262,36 @@ export default function PremiumPage() {
                   <ExternalLink />
                 </Button>
               </a>
+            </div>
+          </section>
+        )}
+
+        {/* DEV: Generate test Premium license */}
+        {isDev && (
+          <section>
+            <div className="rounded-3xl border border-yellow-500/40 bg-yellow-500/5 p-5">
+              <div className="flex items-center gap-3 mb-3">
+                <span className="inline-block size-2 rounded-full bg-yellow-600" />
+                <h2 className="text-sm font-medium text-yellow-700 dark:text-yellow-400">Developer Tools</h2>
+              </div>
+              <p className="text-xs text-muted-foreground mb-4">
+                Generate a test Premium license for local development. The test key will enable the live catalog feed.
+              </p>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => generateTestKey.mutate()}
+                disabled={generateTestKey.isPending}
+                className="border-yellow-500/40 text-yellow-700 dark:text-yellow-400 hover:bg-yellow-500/10"
+              >
+                {generateTestKey.isPending ? '⏳ Generating…' : '✨ Generate Test License'}
+              </Button>
+              {generateTestKey.isError && (
+                <p className="text-destructive text-xs mt-2">{(generateTestKey.error as Error).message}</p>
+              )}
+              {generateTestKey.isSuccess && (
+                <p className="text-emerald-600 dark:text-emerald-400 text-xs mt-2">✅ Test license created! Refresh the page to see it applied.</p>
+              )}
             </div>
           </section>
         )}
