@@ -6,6 +6,7 @@ server/data/
 *.db-shm
 *.bak
 .env
+.idea
 .env.local
 .DS_Store
 
