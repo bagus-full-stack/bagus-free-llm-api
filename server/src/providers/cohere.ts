@@ -2,11 +2,32 @@ import type {
   ChatMessage,
   ChatCompletionResponse,
   ChatCompletionChunk,
+  ChatToolDefinition,
 } from '@freellmapi/shared/types.js';
-import { BaseProvider, providerHttpError, type CompletionOptions } from './base.js';
+import { BaseProvider, providerHttpError, type CompletionOptions, type KeyValidationResult } from './base.js';
+import { extendedBodyParams } from '../lib/sampling-params.js';
 import { flattenMessageContent } from '../lib/content.js';
+import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
+import { stripSchemaKeys } from '../lib/tool-args.js';
 
 const API_BASE = 'https://api.cohere.ai/compatibility/v1';
+
+// Cohere's compat-endpoint tool-schema validator rejects a couple of JSON-Schema
+// keywords that strict clients (opencode, continue.dev) send by default, 400-ing
+// the whole request and silently killing tool calls. They carry no meaning for
+// the provider, so strip them before sending. Mirrors google.ts's sanitizeForGemini
+// but scoped to the keys Cohere actually rejects, since its endpoint is otherwise
+// OpenAI-compatible. (Multi-fork-validated: SeanPedersen, andersmmg, chirag127.)
+const COHERE_UNSUPPORTED_SCHEMA_KEYS = new Set(['additionalProperties', '$schema']);
+
+function sanitizeCohereTools(tools?: ChatToolDefinition[]): ChatToolDefinition[] | undefined {
+  if (!tools || tools.length === 0) return tools;
+  return tools.map((t) =>
+    t.function?.parameters
+      ? { ...t, function: { ...t.function, parameters: stripSchemaKeys(t.function.parameters, COHERE_UNSUPPORTED_SCHEMA_KEYS) } }
+      : t,
+  );
+}
 
 export class CohereProvider extends BaseProvider {
   readonly platform = 'cohere' as const;
@@ -17,6 +38,7 @@ export class CohereProvider extends BaseProvider {
     messages: ChatMessage[],
     modelId: string,
     options?: CompletionOptions,
+    quotaContext?: QuotaObservationContext,
   ): Promise<ChatCompletionResponse> {
     const body: Record<string, unknown> = {
       model: modelId,
@@ -24,8 +46,10 @@ export class CohereProvider extends BaseProvider {
       temperature: options?.temperature,
       max_tokens: options?.max_tokens,
       top_p: options?.top_p,
-      tools: options?.tools,
+      stop: options?.stop,
+      tools: sanitizeCohereTools(options?.tools),
       tool_choice: options?.tool_choice,
+      ...extendedBodyParams(this.platform, options),
     };
 
     const res = await this.fetchWithTimeout(`${API_BASE}/chat/completions`, {
@@ -35,6 +59,16 @@ export class CohereProvider extends BaseProvider {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
+      // 'request' bounds: the deadline covers the body read too, so a 200
+      // whose body hangs aborts instead of stalling res.json() forever.
+    }, undefined, { signal: options?.signal, timeoutBounds: 'request' });
+    recordQuotaObservationsFromResponse(res, {
+      platform: this.platform,
+      keyId: quotaContext?.keyId,
+      providerAccountId: quotaContext?.providerAccountId,
+      modelId,
+      quotaPoolKey: quotaContext?.quotaPoolKey,
+      endpoint: 'chat/completions',
     });
 
     if (!res.ok) {
@@ -52,6 +86,7 @@ export class CohereProvider extends BaseProvider {
     messages: ChatMessage[],
     modelId: string,
     options?: CompletionOptions,
+    quotaContext?: QuotaObservationContext,
   ): AsyncGenerator<ChatCompletionChunk> {
     const body: Record<string, unknown> = {
       model: modelId,
@@ -59,8 +94,10 @@ export class CohereProvider extends BaseProvider {
       temperature: options?.temperature,
       max_tokens: options?.max_tokens,
       top_p: options?.top_p,
-      tools: options?.tools,
+      stop: options?.stop,
+      tools: sanitizeCohereTools(options?.tools),
       tool_choice: options?.tool_choice,
+      ...extendedBodyParams(this.platform, options),
       stream: true,
     };
 
@@ -71,6 +108,16 @@ export class CohereProvider extends BaseProvider {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
+      // Default 'headers' bounds: the deadline dies at response headers, and
+      // the client signal + stall watchdog own the stream from there.
+    }, undefined, { signal: options?.signal });
+    recordQuotaObservationsFromResponse(res, {
+      platform: this.platform,
+      keyId: quotaContext?.keyId,
+      providerAccountId: quotaContext?.providerAccountId,
+      modelId,
+      quotaPoolKey: quotaContext?.quotaPoolKey,
+      endpoint: 'chat/completions',
     });
 
     if (!res.ok) {
@@ -81,13 +128,21 @@ export class CohereProvider extends BaseProvider {
     yield* this.readSseStream(res);
   }
 
-  async validateKey(apiKey: string): Promise<boolean> {
+  async validateKey(apiKey: string, quotaContext?: QuotaObservationContext): Promise<KeyValidationResult> {
     // Transport errors propagate — health.ts marks status='error' without
     // counting toward auto-disable. Only confirmed 401/403 disables a key.
     const res = await this.fetchWithTimeout(`${API_BASE}/models`, {
       method: 'GET',
       headers: { 'Authorization': `Bearer ${apiKey}` },
-    }, 10000);
-    return res.status !== 401 && res.status !== 403;
+    }, 10000, { timeoutBounds: 'request' });
+    recordQuotaObservationsFromResponse(res, {
+      platform: this.platform,
+      keyId: quotaContext?.keyId,
+      providerAccountId: quotaContext?.providerAccountId,
+      modelId: quotaContext?.modelId,
+      quotaPoolKey: quotaContext?.quotaPoolKey,
+      endpoint: 'models',
+    });
+    return this.validationResult(res);
   }
 }

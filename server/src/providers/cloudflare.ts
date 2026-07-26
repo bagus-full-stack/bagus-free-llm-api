@@ -3,17 +3,37 @@ import type {
   ChatCompletionResponse,
   ChatCompletionChunk,
 } from '@freellmapi/shared/types.js';
-import { BaseProvider, providerHttpError, type CompletionOptions } from './base.js';
+import { BaseProvider, providerHttpError, type CompletionOptions, type KeyValidationResult, type KeyValidationFailure } from './base.js';
+import { extendedBodyParams } from '../lib/sampling-params.js';
 import { contentToString } from '../lib/content.js';
+import { extractThinkFromMessage } from '../lib/think-tags.js';
+import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
+import { providerTimeoutMs } from '../lib/provider-timeout.js';
 
 /**
  * Cloudflare Workers AI provider.
  * API key format expected: "account_id:api_token"
  * The account_id is extracted from the key to build the URL.
  */
+
+// Workers AI hosts reasoning models (@cf/zai-org/glm-4.7-flash) that spend
+// well over the 15s fetch default before the first byte (live sweep
+// 2026-07-11: repeated 15s aborts). Matches zhipu/agnes/ollama bumps.
+// PROVIDER_TIMEOUT_CLOUDFLARE overrides (#547).
+const CHAT_TIMEOUT_MS = providerTimeoutMs('cloudflare', 60_000);
+const GLM_47_FLASH_TIMEOUT_MS = 200_000;
+
 export class CloudflareProvider extends BaseProvider {
   readonly platform = 'cloudflare' as const;
   readonly name = 'Cloudflare Workers AI';
+
+  private timeoutFor(modelId: string, override?: number): number {
+    if (override !== undefined) return override;
+    if (CHAT_TIMEOUT_MS <= 0) return CHAT_TIMEOUT_MS;
+    return modelId === '@cf/zai-org/glm-4.7-flash'
+      ? Math.max(CHAT_TIMEOUT_MS, GLM_47_FLASH_TIMEOUT_MS)
+      : CHAT_TIMEOUT_MS;
+  }
 
   private parseKey(apiKey: string): { accountId: string; token: string } {
     const sep = apiKey.indexOf(':');
@@ -34,6 +54,7 @@ export class CloudflareProvider extends BaseProvider {
     messages: ChatMessage[],
     modelId: string,
     options?: CompletionOptions,
+    quotaContext?: QuotaObservationContext,
   ): Promise<ChatCompletionResponse> {
     const { accountId, token } = this.parseKey(apiKey);
     const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/v1/chat/completions`;
@@ -50,10 +71,22 @@ export class CloudflareProvider extends BaseProvider {
         temperature: options?.temperature,
         max_tokens: options?.max_tokens,
         top_p: options?.top_p,
+        stop: options?.stop,
         tools: options?.tools,
         tool_choice: options?.tool_choice,
         parallel_tool_calls: options?.parallel_tool_calls,
+        ...extendedBodyParams(this.platform, options),
       }),
+      // 'request' bounds: the deadline covers the body read too, so a 200
+      // whose body hangs aborts instead of stalling res.json() forever.
+    }, this.timeoutFor(modelId, options?.timeoutMs), { signal: options?.signal, timeoutBounds: 'request' });
+    recordQuotaObservationsFromResponse(res, {
+      platform: this.platform,
+      keyId: quotaContext?.keyId,
+      providerAccountId: quotaContext?.providerAccountId,
+      modelId,
+      quotaPoolKey: quotaContext?.quotaPoolKey,
+      endpoint: 'chat/completions',
     });
 
     if (!res.ok) {
@@ -62,6 +95,12 @@ export class CloudflareProvider extends BaseProvider {
     }
 
     const data = await res.json() as ChatCompletionResponse;
+    // Workers AI hosts DeepSeek-style models that inline their reasoning trace
+    // as a leading `<think>…</think>` block in content; move it to
+    // reasoning_content (no-op for messages without the tag).
+    for (const choice of data.choices ?? []) {
+      if (choice?.message) extractThinkFromMessage(choice.message);
+    }
     data._routed_via = { platform: 'cloudflare', model: modelId };
     return data;
   }
@@ -71,6 +110,7 @@ export class CloudflareProvider extends BaseProvider {
     messages: ChatMessage[],
     modelId: string,
     options?: CompletionOptions,
+    quotaContext?: QuotaObservationContext,
   ): AsyncGenerator<ChatCompletionChunk> {
     const { accountId, token } = this.parseKey(apiKey);
     const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/v1/chat/completions`;
@@ -87,11 +127,23 @@ export class CloudflareProvider extends BaseProvider {
         temperature: options?.temperature,
         max_tokens: options?.max_tokens,
         top_p: options?.top_p,
+        stop: options?.stop,
         tools: options?.tools,
         tool_choice: options?.tool_choice,
         parallel_tool_calls: options?.parallel_tool_calls,
+        ...extendedBodyParams(this.platform, options),
         stream: true,
       }),
+      // Default 'headers' bounds: the deadline dies at response headers, and
+      // the client signal + stall watchdog own the stream from there.
+    }, this.timeoutFor(modelId, options?.timeoutMs), { signal: options?.signal });
+    recordQuotaObservationsFromResponse(res, {
+      platform: this.platform,
+      keyId: quotaContext?.keyId,
+      providerAccountId: quotaContext?.providerAccountId,
+      modelId,
+      quotaPoolKey: quotaContext?.quotaPoolKey,
+      endpoint: 'chat/completions',
     });
 
     if (!res.ok) {
@@ -102,18 +154,59 @@ export class CloudflareProvider extends BaseProvider {
     yield* this.readSseStream(res);
   }
 
-  async validateKey(apiKey: string): Promise<boolean> {
+  async validateKey(apiKey: string, quotaContext?: QuotaObservationContext): Promise<KeyValidationResult> {
     // Transport errors propagate — health.ts marks status='error' without
     // counting toward auto-disable. Only confirmed bad/inactive tokens disable.
-    const { token } = this.parseKey(apiKey);
-    const res = await this.fetchWithTimeout(
+    const { accountId, token } = this.parseKey(apiKey);
+
+    // Account-scoped Workers AI tokens 403 on /user/tokens/verify; they can only
+    // self-verify via /accounts/{id}/tokens/verify. User-scoped tokens are the
+    // opposite. Try the self-verify endpoint first, then fall back to the
+    // account-scoped one before treating an auth failure as a bad key. (#297)
+    const userResult = await this.verifyAt(
       'https://api.cloudflare.com/client/v4/user/tokens/verify',
+      token,
+      quotaContext,
+    );
+    if ('result' in userResult) return userResult.result;
+
+    const accountResult = await this.verifyAt(
+      `https://api.cloudflare.com/client/v4/accounts/${accountId}/tokens/verify`,
+      token,
+      quotaContext,
+    );
+    if ('result' in accountResult) return accountResult.result;
+    return accountResult.authFailed;
+  }
+
+  // Hits a Cloudflare token-verify endpoint. Returns {result} for a definitive
+  // verdict, or {authFailed} when the token lacks access to THIS endpoint
+  // (401/403) so the caller can try the other scope — carrying the upstream
+  // reason so a key that fails both scopes still surfaces why.
+  private async verifyAt(url: string, token: string, quotaContext?: QuotaObservationContext): Promise<{ result: KeyValidationResult } | { authFailed: KeyValidationFailure }> {
+    const res = await this.fetchWithTimeout(
+      url,
       { method: 'GET', headers: { 'Authorization': `Bearer ${token}` } },
       10000,
+      { timeoutBounds: 'request' },
     );
-    if (res.status === 401 || res.status === 403) return false;
-    if (!res.ok) return true; // unexpected non-2xx that isn't auth — don't disable
+    recordQuotaObservationsFromResponse(res, {
+      platform: this.platform,
+      keyId: quotaContext?.keyId,
+      providerAccountId: quotaContext?.providerAccountId,
+      modelId: quotaContext?.modelId,
+      quotaPoolKey: quotaContext?.quotaPoolKey,
+      endpoint: 'tokens/verify',
+    });
+    if (res.status === 401 || res.status === 403) {
+      return { authFailed: await this.validationResult(res) as KeyValidationFailure };
+    }
+    if (!res.ok) return { result: true }; // unexpected non-2xx that isn't auth — don't disable
     const data = await res.json() as any;
-    return data.success === true && data.result?.status === 'active';
+    if (data.success === true && data.result?.status === 'active') return { result: true };
+    const reason = data.result?.status
+      ? `token status is "${data.result.status}"`
+      : data.errors?.[0]?.message ?? 'verify endpoint did not confirm an active token';
+    return { result: { valid: false, error: `${this.name} key validation failed: ${reason}` } };
   }
 }

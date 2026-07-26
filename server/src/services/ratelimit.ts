@@ -1,6 +1,7 @@
 // Sliding window rate limit tracker with SQLite persistence.
 
 import { getDb } from '../db/index.js';
+import { isLoopbackOrPrivateUrl } from '../lib/url-guard.js';
 
 interface Window {
   timestamps: number[];
@@ -30,12 +31,165 @@ function pruneTimestamps(timestamps: number[], windowMs: number, now: number): n
 const MINUTE = 60 * 1000;
 const DAY = 24 * 60 * MINUTE;
 
+/** Milliseconds elapsed since the most recent midnight UTC. Used as the window
+ *  width for provider-account daily caps, which reset on a day boundary rather
+ *  than sliding. Never exceeds DAY, so it stays inside the usage-table retention. */
+function msSinceUtcMidnight(now: number): number {
+  return now - new Date(now).setUTCHours(0, 0, 0, 0);
+}
+
 function withDb<T>(fn: (db: RateLimitDb) => T): T | undefined {
   try {
     return fn(getDb());
   } catch {
     return undefined;
   }
+}
+
+// ── In-flight leases ──────────────────────────────────────────────────────────
+// Usage is only recorded *after* an attempt succeeds, so between key selection
+// and that write the router has no idea a request is already in the air. A lease
+// makes that window visible. Today it backs the per-key concurrency cap; it is
+// also the hook for counting provisional usage against the quota gates, which is
+// what closes the check-then-act race under parallel load.
+//
+// Leases live in memory only: they describe requests this process currently has
+// open, so there is nothing meaningful to persist and a restart correctly starts
+// from zero.
+
+interface Lease {
+  platform: string;
+  modelId: string;
+  keyId: number;
+  tokens: number;
+  createdAt: number;
+}
+
+const leases = new Map<number, Lease>();
+let nextLeaseId = 1;
+
+// A lease should always be released explicitly by the fallback loop's finally
+// block. This bound is the backstop for a path that somehow doesn't: without it
+// a single leaked lease would count against a key's concurrency budget forever.
+// Comfortably longer than the per-attempt provider timeout.
+const LEASE_MAX_AGE_MS = 2 * MINUTE;
+
+function pruneLeases(now: number): void {
+  if (leases.size === 0) return;
+  for (const [id, lease] of leases) {
+    if (now - lease.createdAt > LEASE_MAX_AGE_MS) leases.delete(id);
+  }
+}
+
+/**
+ * Concurrent in-flight requests allowed per key, or null for unlimited.
+ *
+ * Some free tiers meter concurrency per credential rather than per minute, so
+ * parallel streams on one key mostly 429 each other. But most do not, and
+ * capping by default would serialise every provider and cost real throughput —
+ * so this is opt-in. There is deliberately no built-in per-platform table: the
+ * providers that behave this way are not documented well enough to assert a
+ * number for them here, and a wrong default is worse than none.
+ *
+ * `MAX_CONCURRENT_REQUESTS_PER_KEY_<PLATFORM>` sets it for one platform;
+ * `MAX_CONCURRENT_REQUESTS_PER_KEY` sets a fallback for all of them.
+ */
+export function getKeyConcurrencyLimit(platform: string): number | null {
+  const raw = process.env[`MAX_CONCURRENT_REQUESTS_PER_KEY_${platform.toUpperCase()}`]
+    ?? process.env.MAX_CONCURRENT_REQUESTS_PER_KEY;
+  if (raw !== undefined && raw.trim() !== '') {
+    const n = Number(raw);
+    if (Number.isInteger(n) && n > 0) return n;
+  }
+  return null;
+}
+
+/** Requests this process currently has in flight against one platform+key. */
+export function inFlightForKey(platform: string, keyId: number, now = Date.now()): number {
+  pruneLeases(now);
+  let count = 0;
+  for (const lease of leases.values()) {
+    if (lease.platform === platform && lease.keyId === keyId) count++;
+  }
+  return count;
+}
+
+/** False when this key already has its allowed number of requests in the air.
+ *  Always true when no cap is configured, which is the default. */
+export function canUseKeyConcurrency(platform: string, keyId: number, now = Date.now()): boolean {
+  const limit = getKeyConcurrencyLimit(platform);
+  if (limit === null) return true;
+  return inFlightForKey(platform, keyId, now) < limit;
+}
+
+/** Take a lease for an attempt about to be dispatched. Returns the id to release. */
+export function acquireLease(
+  platform: string,
+  modelId: string,
+  keyId: number,
+  tokens: number,
+  now = Date.now(),
+): number {
+  pruneLeases(now);
+  const id = nextLeaseId++;
+  leases.set(id, { platform, modelId, keyId, tokens, createdAt: now });
+  return id;
+}
+
+/** Release a lease. Idempotent, so a double release from overlapping cleanup
+ *  paths is harmless. */
+export function releaseLease(leaseId: number): void {
+  leases.delete(leaseId);
+}
+
+/** Test seam: drop all leases. */
+export function resetLeases(): void {
+  leases.clear();
+}
+
+// ── Provisional usage ─────────────────────────────────────────────────────────
+// Every gate below adds in-flight leases on top of the recorded counters. This is
+// what closes the check-then-act race: routeRequest is synchronous but usage is
+// only written after the awaited provider call, so N concurrent requests all read
+// the same pre-check and every one of them passes — then they collectively blow
+// through the limit and collect real 429s. Counting leases makes the second
+// caller see the first one's request.
+//
+// A lease is released just after the success write, so for a brief instant a
+// completed request is counted twice. That errs toward under-dispatching by one,
+// which is the safe direction for a free tier, and lasts microseconds.
+
+function provisionalRequests(platform: string, modelId: string, keyId: number, now: number): number {
+  pruneLeases(now);
+  let count = 0;
+  for (const lease of leases.values()) {
+    if (lease.platform === platform && lease.modelId === modelId && lease.keyId === keyId) count++;
+  }
+  return count;
+}
+
+function provisionalTokens(platform: string, modelId: string, keyId: number, now: number): number {
+  pruneLeases(now);
+  let total = 0;
+  for (const lease of leases.values()) {
+    if (lease.platform === platform && lease.modelId === modelId && lease.keyId === keyId) total += lease.tokens;
+  }
+  return total;
+}
+
+/** In-flight requests for a provider account+key across every model — the
+ *  provider-wide analogue, for the account-level gates. */
+function provisionalProviderRequests(platform: string, keyId: number, now: number): number {
+  return inFlightForKey(platform, keyId, now);
+}
+
+function provisionalProviderTokens(platform: string, keyId: number, now: number): number {
+  pruneLeases(now);
+  let total = 0;
+  for (const lease of leases.values()) {
+    if (lease.platform === platform && lease.keyId === keyId) total += lease.tokens;
+  }
+  return total;
 }
 
 function recordUsage(
@@ -142,13 +296,16 @@ export function canMakeRequest(
   limits: { rpm: number | null; rpd: number | null; tpm: number | null; tpd: number | null },
 ): boolean {
   const now = Date.now();
+  // In-flight requests count against both windows: a lease means the request is
+  // happening now, so it belongs to this minute and to today.
+  const inFlight = provisionalRequests(platform, modelId, keyId, now);
 
   if (limits.rpm !== null) {
-    if (requestCount(platform, modelId, keyId, MINUTE, now) >= limits.rpm) return false;
+    if (requestCount(platform, modelId, keyId, MINUTE, now) + inFlight >= limits.rpm) return false;
   }
 
   if (limits.rpd !== null) {
-    if (requestCount(platform, modelId, keyId, DAY, now) >= limits.rpd) return false;
+    if (requestCount(platform, modelId, keyId, DAY, now) + inFlight >= limits.rpd) return false;
   }
 
   return true;
@@ -162,15 +319,17 @@ export function canUseTokens(
   limits: { tpm: number | null; tpd: number | null },
 ): boolean {
   const now = Date.now();
+  // Tokens already promised to in-flight attempts on this model+key.
+  const inFlight = provisionalTokens(platform, modelId, keyId, now);
 
   if (limits.tpm !== null) {
     const used = tokenCount(platform, modelId, keyId, MINUTE, now);
-    if (used + estimatedTokens > limits.tpm) return false;
+    if (used + inFlight + estimatedTokens > limits.tpm) return false;
   }
 
   if (limits.tpd !== null) {
     const used = tokenCount(platform, modelId, keyId, DAY, now);
-    if (used + estimatedTokens > limits.tpd) return false;
+    if (used + inFlight + estimatedTokens > limits.tpd) return false;
   }
 
   return true;
@@ -190,6 +349,23 @@ const DEFAULT_PROVIDER_DAILY_REQUEST_CAPS: Record<string, number> = {
   openrouter: 1000,
 };
 
+const DEFAULT_PROVIDER_DAILY_TOKEN_CAPS: Record<string, number> = {
+  // NavyAI's free plan is one shared 150K-token/day pool per key. Individual
+  // models carry token_multiplier values, so the provider-visible drain can be
+  // higher than the OpenAI usage.total_tokens returned by /chat/completions.
+  navy: 150_000,
+};
+
+// Per-minute caps that apply to the whole provider account rather than one model.
+// The per-model rpm_limit cannot express these: NVIDIA NIM meters ~40 requests a
+// minute across the entire account, so glm-4.7, minimax-m3 and deepseek all draw
+// from one bucket. Without an account-level gate the router sees each model's own
+// rpm as unspent — and a model row whose rpm_limit is NULL escapes pre-throttling
+// entirely — so it keeps dispatching and eats real 429s.
+const DEFAULT_PROVIDER_MINUTE_REQUEST_CAPS: Record<string, number> = {
+  nvidia: 40,
+};
+
 export function getProviderDailyRequestCap(platform: string): number | null {
   const raw = process.env[`PROVIDER_DAILY_REQUEST_CAP_${platform.toUpperCase()}`];
   if (raw !== undefined && raw.trim() !== '') {
@@ -197,6 +373,26 @@ export function getProviderDailyRequestCap(platform: string): number | null {
     if (Number.isFinite(n) && n >= 0) return n === 0 ? null : n;
   }
   return DEFAULT_PROVIDER_DAILY_REQUEST_CAPS[platform] ?? null;
+}
+
+/** Account-wide requests-per-minute cap, or null when the provider has none.
+ *  `PROVIDER_MINUTE_REQUEST_CAP_<PLATFORM>=0` disables the gate for that platform. */
+export function getProviderMinuteRequestCap(platform: string): number | null {
+  const raw = process.env[`PROVIDER_MINUTE_REQUEST_CAP_${platform.toUpperCase()}`];
+  if (raw !== undefined && raw.trim() !== '') {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0) return n === 0 ? null : n;
+  }
+  return DEFAULT_PROVIDER_MINUTE_REQUEST_CAPS[platform] ?? null;
+}
+
+export function getProviderDailyTokenCap(platform: string): number | null {
+  const raw = process.env[`PROVIDER_DAILY_TOKEN_CAP_${platform.toUpperCase()}`];
+  if (raw !== undefined && raw.trim() !== '') {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0) return n === 0 ? null : n;
+  }
+  return DEFAULT_PROVIDER_DAILY_TOKEN_CAPS[platform] ?? null;
 }
 
 function countPersistedProviderRequests(
@@ -219,15 +415,20 @@ function countPersistedProviderRequests(
 }
 
 // Total requests today for a provider account+key, summed across every model.
+// "Today" is the window since midnight UTC, not a sliding 24h: real provider
+// account caps (OpenRouter, NVIDIA) reset on a wall-clock day boundary, so a
+// sliding window keeps a provider benched well past its actual reset — a burst
+// at 23:00 UTC would still be counted against the account at 22:00 the next day.
 export function providerDailyRequestCount(platform: string, keyId: number, now = Date.now()): number {
-  const persisted = countPersistedProviderRequests(platform, keyId, DAY, now);
+  const windowMs = msSinceUtcMidnight(now);
+  const persisted = countPersistedProviderRequests(platform, keyId, windowMs, now);
   if (persisted !== undefined) return persisted;
   // DB-unavailable fallback: sum the per-model rpd windows for this platform+key.
   // Window key format is "platform:modelId:keyId:rpd" (modelId may contain ':').
   let total = 0;
   for (const [key, w] of windows) {
     if (key.startsWith(`${platform}:`) && key.endsWith(`:${keyId}:rpd`)) {
-      total += pruneTimestamps(w.timestamps, DAY, now).length;
+      total += pruneTimestamps(w.timestamps, windowMs, now).length;
     }
   }
   return total;
@@ -238,7 +439,133 @@ export function providerDailyRequestCount(platform: string, keyId: number, now =
 export function canUseProvider(platform: string, keyId: number, now = Date.now()): boolean {
   const cap = getProviderDailyRequestCap(platform);
   if (cap === null) return true;
-  return providerDailyRequestCount(platform, keyId, now) < cap;
+  const used = providerDailyRequestCount(platform, keyId, now) + provisionalProviderRequests(platform, keyId, now);
+  return used < cap;
+}
+
+/** Requests in the last minute for a provider account+key, across every model. */
+export function providerMinuteRequestCount(platform: string, keyId: number, now = Date.now()): number {
+  const persisted = countPersistedProviderRequests(platform, keyId, MINUTE, now);
+  if (persisted !== undefined) return persisted;
+  // DB-unavailable fallback: sum the per-model rpm windows for this platform+key.
+  let total = 0;
+  for (const [key, w] of windows) {
+    if (key.startsWith(`${platform}:`) && key.endsWith(`:${keyId}:rpm`)) {
+      total += pruneTimestamps(w.timestamps, MINUTE, now).length;
+    }
+  }
+  return total;
+}
+
+// False when this provider account+key has spent its shared per-minute request
+// budget, so the router skips every model on that provider rather than learning
+// the limit again from a 429 on each one in turn.
+export function canUseProviderMinute(platform: string, keyId: number, now = Date.now()): boolean {
+  const cap = getProviderMinuteRequestCap(platform);
+  if (cap === null) return true;
+  const used = providerMinuteRequestCount(platform, keyId, now) + provisionalProviderRequests(platform, keyId, now);
+  return used < cap;
+}
+
+type ModelQuotaRow = { tpd_limit: number | null; monthly_token_budget: string | null };
+
+function multiplierFromQuotaRow(row: ModelQuotaRow | undefined, dailyCap: number): number {
+  if (!row) return 1;
+
+  const fromLabel = row.monthly_token_budget?.match(/(?:^|[\u00b7(\s])(\d+(?:\.\d+)?)x\b/i);
+  if (fromLabel) {
+    const n = Number(fromLabel[1]);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+
+  const tpd = row.tpd_limit;
+  if (tpd != null && tpd > 0 && tpd < dailyCap) return dailyCap / tpd;
+  return 1;
+}
+
+function getProviderTokenMultiplier(platform: string, modelId: string, dailyCap: number): number {
+  if (platform !== 'navy') return 1;
+  return withDb(db => {
+    const row = db.prepare(`
+      SELECT tpd_limit, monthly_token_budget
+        FROM models
+       WHERE platform = ? AND model_id = ?
+       LIMIT 1
+    `).get(platform, modelId) as ModelQuotaRow | undefined;
+    return multiplierFromQuotaRow(row, dailyCap);
+  }) ?? 1;
+}
+
+function providerBilledTokens(platform: string, modelId: string, rawTokens: number): number {
+  if (rawTokens <= 0) return 0;
+  const dailyCap = getProviderDailyTokenCap(platform);
+  if (dailyCap === null) return rawTokens;
+  const multiplier = getProviderTokenMultiplier(platform, modelId, dailyCap);
+  return Math.ceil(rawTokens * multiplier);
+}
+
+function sumPersistedProviderTokens(
+  platform: string,
+  keyId: number,
+  windowMs: number,
+  now: number,
+): number | undefined {
+  const dailyCap = getProviderDailyTokenCap(platform);
+  if (dailyCap === null) return 0;
+
+  return withDb(db => {
+    const rows = db.prepare(`
+      SELECT rlu.model_id, COALESCE(SUM(rlu.tokens), 0) AS used,
+             m.tpd_limit, m.monthly_token_budget
+        FROM rate_limit_usage rlu
+        LEFT JOIN models m ON m.platform = rlu.platform AND m.model_id = rlu.model_id
+       WHERE rlu.platform = ?
+         AND rlu.key_id = ?
+         AND rlu.kind = 'tokens'
+         AND rlu.created_at_ms > ?
+       GROUP BY rlu.model_id
+    `).all(platform, keyId, now - windowMs) as (ModelQuotaRow & { model_id: string; used: number })[];
+
+    return rows.reduce((sum, row) => {
+      const multiplier = platform === 'navy' ? multiplierFromQuotaRow(row, dailyCap) : 1;
+      return sum + Math.ceil(row.used * multiplier);
+    }, 0);
+  });
+}
+
+// Midnight-UTC boundary, for the same reason as providerDailyRequestCount.
+export function providerDailyTokenCount(platform: string, keyId: number, now = Date.now()): number {
+  const windowMs = msSinceUtcMidnight(now);
+  const persisted = sumPersistedProviderTokens(platform, keyId, windowMs, now);
+  if (persisted !== undefined) return persisted;
+
+  let total = 0;
+  const suffix = `:${keyId}:tpd`;
+  for (const [key, w] of windows) {
+    if (!key.startsWith(`${platform}:`) || !key.endsWith(suffix)) continue;
+    const modelId = key.slice(platform.length + 1, -suffix.length);
+    // Read-only: the tpd window is shared with the per-model 24h token check, so
+    // narrowing it to the midnight boundary here must not prune the stored entries.
+    const raw = w.tokenTimestamps
+      .filter(t => t.ts > now - windowMs)
+      .reduce((sum, t) => sum + t.tokens, 0);
+    total += providerBilledTokens(platform, modelId, raw);
+  }
+  return total;
+}
+
+export function canUseProviderTokens(
+  platform: string,
+  keyId: number,
+  modelId: string,
+  estimatedTokens: number,
+  now = Date.now(),
+): boolean {
+  const cap = getProviderDailyTokenCap(platform);
+  if (cap === null) return true;
+  const used = providerDailyTokenCount(platform, keyId, now)
+    + providerBilledTokens(platform, modelId, provisionalProviderTokens(platform, keyId, now));
+  return used + providerBilledTokens(platform, modelId, estimatedTokens) <= cap;
 }
 
 export function recordRequest(platform: string, modelId: string, keyId: number) {
@@ -251,6 +578,8 @@ export function recordRequest(platform: string, modelId: string, keyId: number) 
   getWindow(rpdKey).timestamps.push(now);
 
   recordUsage(platform, modelId, keyId, 'request', 0, now);
+  clearNullLimitHits(platform, modelId, keyId);
+  clearCooldownHits(platform, modelId, keyId);
 }
 
 export function recordTokens(
@@ -273,12 +602,33 @@ export function recordTokens(
 // Cooldown: when a provider returns 429, block that model+key for a period
 const cooldowns = new Map<string, number>(); // key -> expiry timestamp
 
+// ── Cooldown provenance ───────────────────────────────────────────────────────
+// Recorded at setCooldown time so the cooldown-probe recovery job (services/
+// cooldown-probe.ts) can tell OUR guesses apart from provider-stated facts:
+//   'heuristic'     — our own pessimistic bench (transient 90s, escalation
+//                     ladder, auth-failure bench, empty-completion). Often
+//                     outlives the actual outage, so probe-eligible.
+//   'authoritative' — backed by an explicit provider retry time (Retry-After
+//                     that determined the expiry, daily-quota reset). A fact,
+//                     not a guess: never probed.
+//   'credit'        — 402 out-of-credits. A key-validation probe succeeding is
+//                     no evidence the account was topped up, so never probed.
+//   'tier'          — 403 model-not-on-tier. Same reasoning: the key validates
+//                     fine while the model stays gated, so never probed.
+export type CooldownSource = 'heuristic' | 'authoritative' | 'credit' | 'tier';
+
 // Escalating cooldown: track hits per key over a rolling 24h window so a
 // daily-quota exhaustion (OpenRouter free: 50/day, Cohere free: 33/day, etc.)
 // quarantines the key for the rest of the day instead of looping through
 // the 2-minute cooldown 20 times per request and consuming every fallback slot.
 // In-memory only — state resets on restart, which is fine (a clean restart
 // will re-escalate on the next 429 if the quota is genuinely exhausted).
+// A successful request clears the counter (recordRequest → clearCooldownHits),
+// same reversibility contract as nullLimitHits: a served request proves the
+// quota is NOT exhausted right now, so the next failure starts the ladder over
+// instead of inheriting up-to-24h steps from stale hits. While a daily quota is
+// genuinely spent no successes can occur (the counters/cooldowns gate routing),
+// so the intended escalation-across-the-day behavior is untouched.
 const cooldownHits = new Map<string, number[]>(); // key -> timestamps of recent cooldown set events
 const HOUR = 60 * MINUTE;
 const COOLDOWN_DURATIONS = [
@@ -296,6 +646,10 @@ export function getNextCooldownDuration(platform: string, modelId: string, keyId
   cooldownHits.set(key, hits);
   const idx = Math.min(hits.length - 1, COOLDOWN_DURATIONS.length - 1);
   return COOLDOWN_DURATIONS[idx]!;
+}
+
+function clearCooldownHits(platform: string, modelId: string, keyId: number): void {
+  cooldownHits.delete(`${platform}:${modelId}:${keyId}`);
 }
 
 // Short cooldown for a transient (per-minute) 429 — recovers within ~one window.
@@ -316,39 +670,183 @@ export const PAYMENT_REQUIRED_COOLDOWN_MS = DAY;
 // the router fail over to a model the key can actually serve. See issue #256.
 export const MODEL_FORBIDDEN_COOLDOWN_MS = DAY;
 
-// Decide how long to bench a model+key after an upstream 429. Escalate to the
-// long quarantine (getNextCooldownDuration, up to 24h) ONLY when the model is
-// genuinely at its DAILY limit (RPD or TPD) — that won't recover until the
-// provider's daily reset, so a long bench avoids hammering a truly-dead key.
+// When RPD/TPD limits are NULL (provider's published daily quota is unknown or
+// not yet seeded — common for ollama, cloudflare, nvidia, huggingface, mistral,
+// kilo, llm7, pollinations), we cannot check a counter against a cap. Fall back
+// to a hit-count heuristic: after 2+ 429s within this rolling window, treat as
+// "effectively daily-exhausted" and enter the standard escalation ladder at
+// the same step the documented-RPD path would. Without this, these providers
+// stay stuck at TRANSIENT_COOLDOWN_MS forever even when every request is a
+// 429 (observed in production: ollama 130× 429s in 1h with all 90s cooldowns
+// expired before the next request). Cheaper than waiting for the operator to
+// seed per-provider limits (Option A), still reversible — a successful call
+// clears the hit window via the normal path.
 //
-// A transient RPM/TPM 429 gets a short fixed cooldown and does NOT count toward
-// escalation. This is the common case for providers with a tight per-minute
-// token budget but a large daily quota — e.g. groq gpt-oss-120b has rpd=1000
-// yet tpm=8000, so a single burst of large prompts 429s on TPM while the daily
-// quota is barely touched. Without this split, those transient bursts escalated
-// (2m → 10m → 1h → 24h) and quarantined a perfectly healthy provider for the
-// rest of the day. Daily counters are persisted (countPersistedRequests /
-// sumPersistedTokens), so this verdict is stable across restarts.
+// Separate counter from `cooldownHits` (used by getNextCooldownDuration's
+// escalation ladder). The shared Map would make this state path-coupled to
+// the ladder index, which would over-skip steps because the ladder also
+// pushes a hit on each call.
+const NULL_LIMIT_HIT_THRESHOLD = 2;
+const NULL_LIMIT_HIT_WINDOW_MS = HOUR;
+const nullLimitHits = new Map<string, number[]>(); // key -> timestamps
+
+function recordNullLimitHit(platform: string, modelId: string, keyId: number, now: number): void {
+  const key = `${platform}:${modelId}:${keyId}`;
+  const hits = nullLimitHits.get(key) ?? [];
+  hits.push(now);
+  nullLimitHits.set(key, hits);
+}
+
+function clearNullLimitHits(platform: string, modelId: string, keyId: number): void {
+  nullLimitHits.delete(`${platform}:${modelId}:${keyId}`);
+}
+
+export function recentHitCount(
+  platform: string,
+  modelId: string,
+  keyId: number,
+  now: number,
+  windowMs: number = NULL_LIMIT_HIT_WINDOW_MS,
+): number {
+  const key = `${platform}:${modelId}:${keyId}`;
+  const hits = nullLimitHits.get(key) ?? [];
+  return hits.filter(t => t > now - windowMs).length;
+}
+
+// Decide how long to bench a model+key after an upstream 429. Escalate to the
+// long quarantine (getNextCooldownDuration, up to 24h) when the model is at its
+// DAILY limit (RPD/TPD counter ≥ cap), OR — when limits are unknown — when
+// recentHitCount crosses the heuristic threshold. Either way, a long bench
+// avoids hammering a truly-dead key.
+//
+// A transient RPM/TPM 429 with healthy daily counters gets a short fixed
+// cooldown and does NOT count toward escalation. This is the common case for
+// providers with a tight per-minute token budget but a large daily quota —
+// e.g. groq gpt-oss-120b has rpd=1000 yet tpm=8000, so a single burst of large
+// prompts 429s on TPM while the daily quota is barely touched. Daily counters
+// are persisted (countPersistedRequests / sumPersistedTokens), so this verdict
+// is stable across restarts.
+export interface CooldownDecision {
+  durationMs: number;
+  source: CooldownSource;
+}
+
+// ── Local-endpoint exemption (#592) ──────────────────────────────────────────
+// A key whose base_url points at this machine or the LAN (custom-platform
+// Ollama / llama.cpp / LM Studio) has no provider quota to protect: every
+// cooldown longer than a few seconds just strands what is usually the user's
+// ONLY route to that model, turning a slow local generation (timeout) into an
+// "All models exhausted" 429. Such keys are capped at this short bench and
+// never enter the escalation ladder. Source stays 'heuristic' so the
+// cooldown-probe recovery job may clear even that early.
+export const LOCAL_ENDPOINT_COOLDOWN_MS = 5_000;
+
+// base_url is immutable per key id (routes/keys.ts matches custom rows ON
+// base_url — a new endpoint gets a new row, #212), so the verdict can be
+// cached for the life of the process. Built-in platforms have base_url NULL
+// → non-local. A DB that isn't ready yet is NOT cached, so a later call can
+// still decide properly.
+const keyLocality = new Map<number, boolean>(); // keyId -> is local endpoint
+
+export function isLocalEndpointKey(keyId: number): boolean {
+  const cached = keyLocality.get(keyId);
+  if (cached !== undefined) return cached;
+  const baseUrl = withDb(db => {
+    const row = db.prepare('SELECT base_url FROM api_keys WHERE id = ?')
+      .get(keyId) as { base_url: string | null } | undefined;
+    return row?.base_url ?? '';
+  });
+  if (baseUrl === undefined) return false; // DB not ready — don't cache
+  const local = isLoopbackOrPrivateUrl(baseUrl || null);
+  keyLocality.set(keyId, local);
+  return local;
+}
+
+/** Test hook: the locality verdict is cached per key id for the process
+ *  lifetime (see above); tests that rewrite api_keys rows need a reset. */
+export function resetKeyLocalityCache(): void {
+  keyLocality.clear();
+}
+
+export interface CooldownLimitOptions {
+  /** Whether the triggering failure is an actual provider quota signal (a real
+   *  429 / rate-limit-classified error — see isRateLimitSignal in
+   *  lib/error-classify.ts). Timeouts, 5xx and transport errors are retryable
+   *  but carry no quota information, so they must not feed the null-limits
+   *  exhaustion heuristic below (#592) — they get the short transient bench.
+   *  Defaults to true: legacy callers without error context (fusion's
+   *  empty-completion benches) keep their pre-#592 behavior. */
+  quotaSignal?: boolean;
+}
+
 export function getCooldownDurationForLimit(
   platform: string,
   modelId: string,
   keyId: number,
   limits: { rpd: number | null; tpd: number | null },
   retryAfterMs?: number | null,
+  opts?: CooldownLimitOptions,
 ): number {
+  return getCooldownDecisionForLimit(platform, modelId, keyId, limits, retryAfterMs, opts).durationMs;
+}
+
+/**
+ * Same verdict as getCooldownDurationForLimit, plus the provenance the
+ * cooldown-probe recovery job needs: 'authoritative' when an explicit provider
+ * Retry-After actually determined the expiry (a fact — never probed early),
+ * 'heuristic' when the duration is our own transient/escalation guess (probe-
+ * eligible). A Retry-After SHORTER than our bench does not make the cooldown
+ * authoritative: everything past the provider's own retry time is our guess.
+ */
+export function getCooldownDecisionForLimit(
+  platform: string,
+  modelId: string,
+  keyId: number,
+  limits: { rpd: number | null; tpd: number | null },
+  retryAfterMs?: number | null,
+  opts?: CooldownLimitOptions,
+): CooldownDecision {
+  // Local inference endpoint (loopback/RFC1918 base_url): no quota exists, so
+  // neither the transient 90s bench nor the escalation ladder applies — a
+  // failure there means "busy right now", and a few seconds is all the pool
+  // needs before retrying the user's (usually only) local route. Applies even
+  // to a literal 429 (local servers emit them under concurrent load) and
+  // ignores any Retry-After: both describe momentary busyness, not a quota.
+  if (isLocalEndpointKey(keyId)) {
+    return { durationMs: LOCAL_ENDPOINT_COOLDOWN_MS, source: 'heuristic' };
+  }
+  const quotaSignal = opts?.quotaSignal ?? true;
   const now = Date.now();
   const rpdExhausted =
     limits.rpd !== null && requestCount(platform, modelId, keyId, DAY, now) >= limits.rpd;
   const tpdExhausted =
     limits.tpd !== null && tokenCount(platform, modelId, keyId, DAY, now) >= limits.tpd;
-  const base = (rpdExhausted || tpdExhausted)
+  // No daily quota published → use repeated-429 heuristic: 2+ 429s in the
+  // last hour is treated as effectively daily-exhausted. This unsticks
+  // providers that publish no daily cap (ollama, cloudflare, etc.) from the
+  // 90s-cooldown-loop without requiring operator-side limit seeding.
+  // Gated on quotaSignal (#592): only a REAL 429/rate-limit error is evidence
+  // of quota exhaustion. Timeouts and 5xx used to feed this counter too, so
+  // two slow generations on a null-limits route escalated 2m→10m→…→24h.
+  const unknownLimits = limits.rpd === null && limits.tpd === null;
+  let heuristicallyExhausted = false;
+  if (unknownLimits && quotaSignal) {
+    // The current hit is recorded first so the threshold can be reached across
+    // consecutive 429s, but only for providers where counters cannot decide.
+    recordNullLimitHit(platform, modelId, keyId, now);
+    heuristicallyExhausted =
+      recentHitCount(platform, modelId, keyId, now) >= NULL_LIMIT_HIT_THRESHOLD;
+  }
+  const base = (rpdExhausted || tpdExhausted || heuristicallyExhausted)
     ? getNextCooldownDuration(platform, modelId, keyId)
     : TRANSIENT_COOLDOWN_MS;
   // Honor an upstream Retry-After as a floor: never bench shorter than our own
   // heuristic, but extend (capped at a day) when the provider explicitly asks
   // to wait longer than we otherwise would.
-  if (retryAfterMs != null && retryAfterMs > base) return Math.min(retryAfterMs, DAY);
-  return base;
+  if (retryAfterMs != null && retryAfterMs > base) {
+    return { durationMs: Math.min(retryAfterMs, DAY), source: 'authoritative' };
+  }
+  return { durationMs: base, source: 'heuristic' };
 }
 
 function persistedCooldownExpiry(
@@ -368,14 +866,23 @@ function persistedCooldownExpiry(
   });
 }
 
-function persistCooldown(platform: string, modelId: string, keyId: number, expiresAtMs: number) {
+function persistCooldown(
+  platform: string,
+  modelId: string,
+  keyId: number,
+  expiresAtMs: number,
+  source: CooldownSource,
+  setAtMs: number,
+) {
   withDb(db => {
     db.prepare(`
-      INSERT INTO rate_limit_cooldowns (platform, model_id, key_id, expires_at_ms)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO rate_limit_cooldowns (platform, model_id, key_id, expires_at_ms, source, set_at_ms)
+      VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(platform, model_id, key_id)
-      DO UPDATE SET expires_at_ms = excluded.expires_at_ms
-    `).run(platform, modelId, keyId, expiresAtMs);
+      DO UPDATE SET expires_at_ms = excluded.expires_at_ms,
+                    source = excluded.source,
+                    set_at_ms = excluded.set_at_ms
+    `).run(platform, modelId, keyId, expiresAtMs, source, setAtMs);
   });
 }
 
@@ -390,11 +897,18 @@ function clearPersistedCooldown(platform: string, modelId: string, keyId: number
   });
 }
 
-export function setCooldown(platform: string, modelId: string, keyId: number, durationMs = 60_000) {
+export function setCooldown(
+  platform: string,
+  modelId: string,
+  keyId: number,
+  durationMs = 60_000,
+  source: CooldownSource = 'heuristic',
+) {
   const key = `${platform}:${modelId}:${keyId}:cooldown`;
-  const expiresAtMs = Date.now() + durationMs;
+  const now = Date.now();
+  const expiresAtMs = now + durationMs;
   cooldowns.set(key, expiresAtMs);
-  persistCooldown(platform, modelId, keyId, expiresAtMs);
+  persistCooldown(platform, modelId, keyId, expiresAtMs, source, now);
 }
 
 export function isOnCooldown(platform: string, modelId: string, keyId: number): boolean {
@@ -420,6 +934,148 @@ export function isOnCooldown(platform: string, modelId: string, keyId: number): 
   return true;
 }
 
+export interface ActiveCooldown {
+  platform: string;
+  modelId: string;
+  keyId: number;
+  expiresAtMs: number;
+  remainingMs: number;
+}
+
+/**
+ * Active cooldowns for the given keys, grouped by key id. Batched into one query
+ * so the dashboard can render "why is this key idle?" without N round-trips.
+ * Without this, a key benched by an escalated cooldown (up to 24h) is invisible:
+ * it reads as healthy and enabled while the router silently skips it.
+ */
+export function getActiveCooldownsForKeys(
+  keyIds: number[],
+  now = Date.now(),
+): Map<number, ActiveCooldown[]> {
+  const grouped = new Map<number, ActiveCooldown[]>();
+  if (keyIds.length === 0) return grouped;
+
+  const unique = [...new Set(keyIds.filter(id => Number.isInteger(id)))];
+  if (unique.length === 0) return grouped;
+
+  const placeholders = unique.map(() => '?').join(', ');
+  const rows = withDb(db => db.prepare(`
+    SELECT platform, model_id, key_id, expires_at_ms
+      FROM rate_limit_cooldowns
+     WHERE expires_at_ms > ?
+       AND key_id IN (${placeholders})
+     ORDER BY expires_at_ms ASC
+  `).all(now, ...unique) as { platform: string; model_id: string; key_id: number; expires_at_ms: number }[]) ?? [];
+
+  for (const row of rows) {
+    const list = grouped.get(row.key_id) ?? [];
+    list.push({
+      platform: row.platform,
+      modelId: row.model_id,
+      keyId: row.key_id,
+      expiresAtMs: row.expires_at_ms,
+      remainingMs: Math.max(0, row.expires_at_ms - now),
+    });
+    grouped.set(row.key_id, list);
+  }
+  return grouped;
+}
+
+/**
+ * Drop every cooldown for one key, in memory and on disk, and return how many
+ * were cleared. Escalated cooldowns can bench a key for up to 24h off a single
+ * bad window; an operator who has fixed the cause (raised a quota, waited out a
+ * provider incident) otherwise has no way back except restarting and waiting.
+ */
+export function clearCooldownsForKey(keyId: number): number {
+  if (!Number.isInteger(keyId)) return 0;
+
+  const cleared = withDb(db => {
+    const result = db.prepare('DELETE FROM rate_limit_cooldowns WHERE key_id = ?').run(keyId);
+    return Number(result.changes ?? 0);
+  }) ?? 0;
+
+  // The in-memory map is authoritative when the DB read fails, so purge it too.
+  // Key format is "platform:modelId:keyId:cooldown" and modelId may contain ':',
+  // so match on the trailing segments rather than splitting.
+  const suffix = `:${keyId}:cooldown`;
+  let memoryCleared = 0;
+  for (const key of [...cooldowns.keys()]) {
+    if (key.endsWith(suffix)) {
+      cooldowns.delete(key);
+      cooldownHits.delete(key.slice(0, -':cooldown'.length));
+      memoryCleared++;
+    }
+  }
+
+  return Math.max(cleared, memoryCleared);
+}
+
+// ── Cooldown-probe surface (services/cooldown-probe.ts) ───────────────────────
+
+export interface ProbeableCooldown {
+  platform: string;
+  modelId: string;
+  keyId: number;
+  expiresAtMs: number;
+  // Null for rows persisted before the provenance migration; the prober treats
+  // an unknown start time as "old enough to probe".
+  setAtMs: number | null;
+}
+
+/**
+ * Active cooldowns whose expiry is OUR OWN guess ('heuristic'), i.e. the only
+ * ones probe-based early recovery may touch. Authoritative/credit/tier rows are
+ * excluded at the query so the prober cannot even see them. Deliberately
+ * DB-only, no in-memory fallback: the probe job is a best-effort optimisation,
+ * and when the DB is unavailable the right amount of probing is none.
+ */
+export function getProbeableCooldowns(now = Date.now()): ProbeableCooldown[] {
+  const rows = withDb(db => db.prepare(`
+    SELECT platform, model_id, key_id, expires_at_ms, set_at_ms
+      FROM rate_limit_cooldowns
+     WHERE expires_at_ms > ?
+       AND source = 'heuristic'
+     ORDER BY expires_at_ms ASC
+  `).all(now) as { platform: string; model_id: string; key_id: number; expires_at_ms: number; set_at_ms: number | null }[]) ?? [];
+
+  return rows.map(row => ({
+    platform: row.platform,
+    modelId: row.model_id,
+    keyId: row.key_id,
+    expiresAtMs: row.expires_at_ms,
+    setAtMs: row.set_at_ms,
+  }));
+}
+
+/**
+ * Clear ONE model+key cooldown before its timer expires, after a probe showed
+ * the key is serving again. Narrower than clearCooldownsForKey (the operator
+ * override): the escalation history in cooldownHits is deliberately kept, so a
+ * key that 429s again right after an early recovery re-enters the ladder where
+ * it left off instead of starting back at 2 minutes.
+ */
+export function clearCooldownEarly(platform: string, modelId: string, keyId: number): void {
+  cooldowns.delete(`${platform}:${modelId}:${keyId}:cooldown`);
+  clearPersistedCooldown(platform, modelId, keyId);
+}
+
+/**
+ * Soonest moment any active cooldown expires, in ms since epoch, or null when
+ * nothing is cooling down. Used to tell an exhausted caller roughly when to
+ * retry (#423) instead of the bare "wait for rate limits to reset".
+ */
+export function getSoonestCooldownExpiry(now = Date.now()): number | null {
+  return withDb(db => {
+    const row = db.prepare(`
+      SELECT MIN(expires_at_ms) AS soonest
+        FROM rate_limit_cooldowns
+       WHERE expires_at_ms > ?
+    `).get(now) as { soonest: number | null } | undefined;
+    return row?.soonest ?? null;
+  }) ?? null;
+}
+
 export function getRateLimitStatus(
   platform: string,
   modelId: string,
@@ -433,4 +1089,69 @@ export function getRateLimitStatus(
     rpd: { used: requestCount(platform, modelId, keyId, DAY, now), limit: limits.rpd },
     tpm: { used: tokenCount(platform, modelId, keyId, MINUTE, now), limit: limits.tpm },
   };
+}
+
+// ── Learning real provider limits from error bodies (self-correcting catalog) ──
+// Free-tier limits drift and our seeded catalog is frequently wrong or null.
+// When a provider rejects a request with its real limit in the body — Groq 413:
+// "...on tokens per minute (TPM): Limit 30000, Requested 33476" — we can learn
+// that ceiling and persist it so the canUseTokens / canMakeRequest pre-checks
+// stop us BEFORE the next 413 instead of re-discovering it on every request.
+// (Fork-validated: andersmmg's updateLimitsFromError parses the same Groq shape.)
+
+export type LearnedLimitKind = 'tpm' | 'tpd' | 'rpm' | 'rpd';
+export interface LearnedLimit { kind: LearnedLimitKind; limit: number; }
+
+// Order matters: check the per-DAY axes before per-MINUTE so "tokens per day"
+// isn't shadowed by the "tpm" word-boundary alternative, and tokens before
+// requests so a body mentioning both lands on the more specific token ceiling.
+const LIMIT_AXIS_PATTERNS: Array<{ kind: LearnedLimitKind; re: RegExp }> = [
+  { kind: 'tpd', re: /tokens?\s*per\s*day|\btpd\b/i },
+  { kind: 'tpm', re: /tokens?\s*per\s*min(?:ute)?|\btpm\b/i },
+  { kind: 'rpd', re: /requests?\s*per\s*day|\brpd\b/i },
+  { kind: 'rpm', re: /requests?\s*per\s*min(?:ute)?|\brpm\b/i },
+];
+
+/**
+ * Pure parser: pull a provider-reported ceiling out of an error message. Returns
+ * null unless BOTH a numeric "Limit N" and a confident axis (TPM/TPD/RPM/RPD)
+ * are present — guessing the axis would write the wrong column and mis-route
+ * every future request, so we refuse to guess.
+ */
+export function parseProviderLimit(message: string | undefined | null): LearnedLimit | null {
+  if (!message) return null;
+  const m = message.match(/\blimit[:\s]+([\d,]+)/i);
+  if (!m) return null;
+  const limit = Number(m[1]!.replace(/,/g, ''));
+  if (!Number.isFinite(limit) || limit <= 0) return null;
+  for (const { kind, re } of LIMIT_AXIS_PATTERNS) {
+    if (re.test(message)) return { kind, limit };
+  }
+  return null;
+}
+
+// Whitelisted column names — the only values ever interpolated into the UPDATE
+// below, so there is no injection surface despite the template literal.
+const LIMIT_COLUMN: Record<LearnedLimitKind, string> = {
+  tpm: 'tpm_limit', tpd: 'tpd_limit', rpm: 'rpm_limit', rpd: 'rpd_limit',
+};
+
+/**
+ * Persist a provider-reported limit onto the model row, but ONLY when it makes
+ * us more conservative: fill a NULL (unknown) limit, or LOWER an existing one
+ * that was too high. Never raises a limit — hitting a ceiling means our pre-check
+ * already let too much through, so the true limit is at or below what we used.
+ * Returns the learned limit when a row was actually changed, else null.
+ * DB-guarded (no-op when the DB is unavailable), like the rest of this module.
+ */
+export function learnLimitFromError(modelDbId: number, err: { message?: string }): LearnedLimit | null {
+  const parsed = parseProviderLimit(err?.message);
+  if (!parsed) return null;
+  const col = LIMIT_COLUMN[parsed.kind];
+  const result = withDb(db =>
+    db.prepare(
+      `UPDATE models SET ${col} = ? WHERE id = ? AND (${col} IS NULL OR ${col} > ?)`,
+    ).run(parsed.limit, modelDbId, parsed.limit),
+  );
+  return result && result.changes > 0 ? parsed : null;
 }

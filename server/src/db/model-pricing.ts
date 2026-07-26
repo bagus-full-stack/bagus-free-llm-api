@@ -1,4 +1,4 @@
-import type Database from 'better-sqlite3';
+import type { Db } from './types.js';
 
 /**
  * Paid-equivalent pricing per model: what the SAME model (or its nearest
@@ -173,6 +173,10 @@ export const MODEL_PRICING: PricingRow[] = [
   // Pollinations (serves gpt-oss-20b)
   ['pollinations', 'openai-fast', 0.029, 0.14],
 
+  // Reka (live /v1/models pricing, 2026-06-17)
+  ['reka', 'reka-flash-3', 0.10, 0.20],
+  ['reka', 'reka-edge-2603', 0.10, 0.10],
+
   // SambaNova rows were removed in V23 (platform dropped — free tier retired).
 
   // Zhipu (4.5-flash estimated at the 4.7-flash rate — no paid 4.5-flash;
@@ -191,7 +195,7 @@ export const FALLBACK_OUTPUT_PER_M = 0.80;
  * known model. Runs on every boot — it's ~100 UPDATEs in one transaction
  * and keeps prices current when this map is updated in a release.
  */
-export function applyModelPricing(db: Database.Database): void {
+export function applyModelPricing(db: Db): void {
   const columns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
   if (!columns.some(c => c.name === 'paid_input_per_m')) {
     db.prepare('ALTER TABLE models ADD COLUMN paid_input_per_m REAL').run();

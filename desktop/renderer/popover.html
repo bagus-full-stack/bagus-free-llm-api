@@ -132,6 +132,12 @@
   .ghost.copied { color: var(--ok); }
 
   .foot { display: flex; align-items: center; font-size: 11.5px; color: var(--fg-dim); }
+  #login-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .switch {
     position: relative; width: 30px; height: 18px; border-radius: 9px;
     background: var(--switch-off); margin-right: 7px; flex: none;
@@ -146,8 +152,15 @@
   }
   .switch.on { background: var(--ok); }
   .switch.on::after { left: 14px; }
+  .version {
+    flex: none;
+    margin-left: auto;
+    color: var(--fg-faint);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
   .quit {
-    margin-left: auto; background: none; color: var(--fg-dim);
+    margin-left: 6px; background: none; color: var(--fg-dim);
     font-size: 11.5px; padding: 4px 6px; border-radius: 7px;
   }
   .quit:hover { background: rgba(255,255,255,0.08); color: var(--fg); }
@@ -168,27 +181,27 @@
         <div class="title">FreeLLMAPI</div>
         <div class="addr" id="addr">127.0.0.1:…</div>
       </div>
-      <div class="status"><span class="dot"></span>running</div>
+      <div class="status"><span class="dot"></span><span id="status-label">running</span></div>
     </div>
 
     <div class="stats">
       <div class="stat">
         <div class="v" id="reqs">0</div>
-        <div class="l">Requests today</div>
+        <div class="l" id="l-reqs">Requests today</div>
         <div class="sub" id="rate"></div>
       </div>
       <div class="stat">
         <div class="v" id="tokens">0</div>
-        <div class="l">Tokens today</div>
+        <div class="l" id="l-tokens">Tokens today</div>
       </div>
     </div>
 
     <div class="chartwrap">
       <canvas id="chart" width="0" height="0"></canvas>
-      <div class="axis"><span>24h ago</span><span id="peak"></span><span>now</span></div>
+      <div class="axis"><span id="ax-ago">24h ago</span><span id="peak"></span><span id="ax-now">now</span></div>
     </div>
 
-    <div class="lastmodel">Last model <b id="model">—</b></div>
+    <div class="lastmodel"><span id="lastmodel-label">Last model</span> <b id="model">—</b></div>
 
     <div class="actions">
       <button class="primary" id="open">Open Dashboard</button>
@@ -198,7 +211,8 @@
 
     <div class="foot">
       <div class="switch" id="login"></div>
-      <span>Start at login</span>
+      <span id="login-label">Start at login</span>
+      <span class="version" id="version"></span>
       <button class="quit" id="quit">Quit</button>
     </div>
   </div>
@@ -206,6 +220,12 @@
 <script>
   const $ = (id) => document.getElementById(id);
   const fmt = (n) => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n);
+
+  // Native-UI strings for the active locale, sent by main in each snapshot.
+  // Seeded with the English defaults already in the HTML so the very first
+  // paint (before the first snapshot resolves) is never blank.
+  let S = {};
+  const setText = (id, v) => { const el = $(id); if (el && v) el.textContent = v; };
 
   function drawChart(hourly) {
     const c = $('chart');
@@ -229,18 +249,32 @@
       ctx.roundRect(x, y, bw, h, Math.min(3, bw / 2));
       ctx.fill();
     }
-    $('peak').textContent = max > 1 ? 'peak ' + max + '/h' : '';
+    $('peak').textContent = max > 1 ? (S.peak || 'peak {n}/h').replace('{n}', max) : '';
   }
 
   let loginOn = false;
   async function refresh() {
     const s = await window.freeapi.snapshot();
+    S = s.strings || {};
     document.body.classList.toggle('light', s.theme === 'light');
+    // Localize the static labels.
+    setText('status-label', S.running);
+    setText('l-reqs', S.requestsToday);
+    setText('l-tokens', S.tokensToday);
+    setText('lastmodel-label', S.lastModel);
+    setText('open', S.openDashboard);
+    setText('copyurl', S.copyUrl);
+    setText('copykey', S.copyKey);
+    setText('login-label', S.startAtLogin);
+    setText('quit', S.quit);
+    setText('ax-ago', S.hoursAgo);
+    setText('ax-now', S.now);
     $('addr').textContent = '127.0.0.1:' + s.port;
     $('reqs').textContent = fmt(s.requests);
     $('tokens').textContent = fmt(s.tokens);
-    $('rate').textContent = s.successRate == null ? '' : s.successRate + '% success';
+    $('rate').textContent = s.successRate == null ? '' : (S.successSuffix || '{n}% success').replace('{n}', s.successRate);
     $('model').textContent = s.lastModel;
+    $('version').textContent = s.version ? 'v' + s.version : '';
     loginOn = s.loginItem;
     $('login').classList.toggle('on', loginOn);
     drawChart(s.hourly);
@@ -253,8 +287,8 @@
   }
 
   $('open').addEventListener('click', () => window.freeapi.openDashboard());
-  $('copyurl').addEventListener('click', (e) => { window.freeapi.copyBaseUrl(); flash(e.target, 'Copied ✓'); });
-  $('copykey').addEventListener('click', (e) => { window.freeapi.copyApiKey(); flash(e.target, 'Copied ✓'); });
+  $('copyurl').addEventListener('click', (e) => { window.freeapi.copyBaseUrl(); flash(e.target, S.copied || 'Copied ✓'); });
+  $('copykey').addEventListener('click', (e) => { window.freeapi.copyApiKey(); flash(e.target, S.copied || 'Copied ✓'); });
   $('quit').addEventListener('click', () => window.freeapi.quit());
   $('login').addEventListener('click', () => {
     loginOn = !loginOn;

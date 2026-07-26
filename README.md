@@ -2,16 +2,21 @@
 
 # FreeLLMAPI
 
-**One OpenAI-compatible endpoint. Sixteen free LLM providers. ~1.7B tokens per month.**
+**One OpenAI-compatible endpoint. 28 free LLM providers. 339 free model endpoints. ~4 billion tokens per month.**
 
-Aggregate the free tiers from Google, Groq, Cerebras, NVIDIA, Mistral, OpenRouter, GitHub Models, Cohere, Cloudflare, HuggingFace, Z.ai (Zhipu), Ollama, Kilo, Pollinations, LLM7, OVH AI Endpoints, and OpenCode Zen — plus any custom OpenAI-compatible endpoint (llama.cpp, LM Studio, vLLM, local Ollama) — behind a single `/v1/chat/completions` endpoint. Keys are stored encrypted. A router picks the best available model for each request, falls over to the next provider when one is rate-limited, and tracks per-key usage so you stay under every free-tier cap.
+Aggregate free tiers from dozens of providers, plus custom OpenAI-compatible chat, embedding, image, and audio endpoints, behind a single `/v1` API. Keys are stored encrypted. A router picks the best available model for each request, falls over to the next provider when one is rate-limited, and tracks per-key usage so you stay under every free-tier cap.
 
 [![CI](https://github.com/tashfeenahmed/freellmapi/actions/workflows/ci.yml/badge.svg)](https://github.com/tashfeenahmed/freellmapi/actions/workflows/ci.yml)
+[![GitHub stars](https://img.shields.io/github/stars/tashfeenahmed/freellmapi?style=flat&logo=github&color=yellow)](https://github.com/tashfeenahmed/freellmapi/stargazers)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
 [![Docker image](https://img.shields.io/badge/ghcr.io-freellmapi-2496ED?logo=docker&logoColor=white)](https://github.com/tashfeenahmed/freellmapi/pkgs/container/freellmapi)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/tashfeenahmed/freellmapi)
 
-**[freellmapi.co](https://freellmapi.co)** — browse the live model catalog
+**[freellmapi.co](https://freellmapi.co/?utm_source=github&utm_medium=readme&utm_campaign=repository&utm_content=readme_top)** · browse the full catalog: 235 model families, 339 free endpoints
+
+Your router updates its own model catalog from a signed feed: new free models, quota changes, and compatibility fixes land without a `git pull`.
+**[Go live at freellmapi.co](https://freellmapi.co/?utm_source=github&utm_medium=readme&utm_campaign=premium&utm_content=readme_top#pricing)** ($19/yr, cancel anytime).
 
 ![Fallback chain with per-provider token budget](repo-assets/fallback-chain.png)
 
@@ -26,23 +31,29 @@ Aggregate the free tiers from Google, Groq, Cerebras, NVIDIA, Mistral, OpenRoute
 - [Features](#features)
 - [Not yet supported](#not-yet-supported)
 - [Quick start](#quick-start)
+- [Works with OpenAI-compatible clients](#works-with-openai-compatible-clients)
 - [Docker](#docker)
 - [Desktop app](#desktop-app)
+- [Languages](#languages)
 - [Premium (live catalog)](#premium-live-catalog)
 - [Using the API](#using-the-api)
 - [Screenshots](#screenshots)
 - [How it works](#how-it-works)
 - [Context Handoff](#context-handoff)
 - [Limitations](#limitations)
+- [Documentation index](docs/README.md)
+- [Contributor guide](CONTRIBUTING.md)
 - [Contributing](#contributing)
 - [Terms of Service review](#terms-of-service-review)
 - [Disclaimer](#disclaimer)
 
 ## Why this exists
 
-Every serious AI lab now offers a free tier — a few million tokens a month, a few thousand requests a day. On its own each tier is a toy. Stacked together, they add up to roughly **1.7 billion tokens per month** of working inference capacity, across 100+ models from small-and-fast to reasonably capable.
+Every serious AI lab now offers a free tier — a few million tokens a month, a few thousand requests a day. On its own each tier is a toy. Stacked together, they add up to roughly **4 billion tokens per month** of working inference capacity, across **235 model families / 339 provider endpoints** from small-and-fast to reasonably capable.
 
-The problem is that stacking them by hand is painful: seventeen different SDKs, seventeen different rate limits, seventeen places a request can fail. FreeLLMAPI collapses that into one OpenAI-compatible endpoint. Point any OpenAI client library at your local server, and it routes transparently across whichever providers you've added keys for.
+The problem is that stacking them by hand is painful: twenty-eight different SDKs, twenty-eight different rate limits, twenty-eight places a request can fail. FreeLLMAPI collapses that into one OpenAI-compatible endpoint. Point any OpenAI client library at your local server, and it routes transparently across whichever providers you've added keys for.
+
+And the free-tier landscape shifts weekly: providers launch models, retire them, and change quotas without notice. FreeLLMAPI tracks all of that for you. The router pulls a signed model catalog from [freellmapi.co](https://freellmapi.co) on its own, so your install keeps up without a `git pull`. See [Premium (live catalog)](#premium-live-catalog) for how fast it keeps up.
 
 ## Supported providers
 
@@ -65,38 +76,44 @@ The problem is that stacking them by hand is painful: seventeen different SDKs, 
 <td align="center"><a href="https://build.nvidia.com"><b>NVIDIA</b><br/>NIM · 40 RPM free (eval-only ToS)</a></td>
 <td align="center"><a href="https://huggingface.co/docs/inference-providers"><b>HuggingFace</b><br/>Router → DeepSeek V4 · Kimi K2.6 · Qwen3</a></td>
 </tr>
-<tr>
-<td align="center"><a href="https://ollama.com"><b>Ollama Cloud</b><br/>GLM-4.7 · Kimi K2 · gpt-oss · Qwen3</a></td>
-<td align="center"><a href="https://kilo.ai"><b>Kilo Gateway</b><br/>:free routes (anon ok)</a></td>
-<td align="center"><a href="https://pollinations.ai"><b>Pollinations</b><br/>GPT-OSS 20B (anon ok)</a></td>
-<td align="center"><a href="https://llm7.io"><b>LLM7</b><br/>GPT-OSS · Llama 3.1 · GLM (anon ok)</a></td>
-</tr>
-<tr>
-<td align="center"><a href="https://endpoints.ai.cloud.ovh.net"><b>OVH AI Endpoints</b><br/>Qwen3.5 397B · GPT-OSS · Llama 3.3 (anon ok)</a></td>
-<td align="center"></td>
-<td align="center"></td>
-<td align="center"></td>
-</tr>
 </table>
 
-Plus a **custom** provider — point at any OpenAI-compatible endpoint (llama.cpp, LM Studio, vLLM, a local Ollama, or a remote gateway) from the Keys page.
+<p align="center"><strong>…and many more.</strong></p>
+
+Plus a **custom** provider — point chat, embedding, image, or audio models at any OpenAI-compatible endpoint (llama.cpp, LM Studio, vLLM, a local Ollama, or a remote gateway) from the Keys page.
+
+The full, always-current list lives at **[freellmapi.co/models](https://freellmapi.co/models.html)** with per-model rate limits, context windows, and free-token budgets.
 
 ## Features
 
 - **OpenAI-compatible** — `POST /v1/chat/completions` and `GET /v1/models` work with the official OpenAI SDKs and any OpenAI-compatible client (LangChain, LlamaIndex, Continue, Hermes, etc.). Just change `base_url`.
 - **Responses API** — `POST /v1/responses` (the wire format current Codex CLI versions require) is implemented as a translating shim over the same router, with full streaming events and tool calls.
+- **Editor autocomplete** — `POST /v1/completions` translates legacy prompt/suffix requests into the same router, so VS Code ghost-text clients such as Continue can use FreeLLMAPI for inline suggestions.
+- **Anthropic Messages API** — `POST /v1/messages` (plus `/v1/messages/count_tokens`) speaks Anthropic's wire format over the same router, so **Claude Code** and the official Anthropic SDKs run against your free pool. `GET /v1/models` is content-negotiated (Anthropic shape when the client sends `anthropic-version`, OpenAI shape otherwise), and Claude families (`opus` / `sonnet` / `haiku` / `default`) map to `auto` or a pinned model on the Keys page. See [Anthropic / Claude clients](#anthropic--claude-clients).
+- **Fusion (multi-model synthesis)** — request the virtual `fusion` model and the router fans your prompt out to a panel of diverse free models in parallel, then a judge model synthesizes one answer from the drafts. Panel, judge, and strategy are configurable on the dashboard's **Fusion** page or per request via the `fusion` field; each sub-call goes through normal routing, quotas, and analytics.
+- **Image generation & text-to-speech** — `POST /v1/images/generations` and `POST /v1/audio/speech` route across the providers that serve media models, including custom OpenAI-compatible media endpoints. Browse and toggle them on the dashboard's **Models → Image / Audio** tabs.
+- **Self-updating model catalog** — the router syncs a signed catalog from freellmapi.co twice a day: new models, quota changes, and provider quirk fixes land in your install automatically. See [Premium (live catalog)](#premium-live-catalog).
 - **Streaming and non-streaming** — Server-Sent Events for `stream: true`, JSON response otherwise. Every provider adapter implements both.
-- **Tool calling** — OpenAI-style `tools` / `tool_choice` requests are passed through, and assistant `tool_calls` + `tool` role follow-up messages round-trip across providers.
-- **Embeddings** — `/v1/embeddings` with family-based routing: failover only ever happens between providers serving the *same* model (vectors from different models are incompatible), never across models. See [Embeddings](#embeddings).
-- **Automatic fallover** — If the chosen provider returns a 429, 5xx, or times out, the router skips it, puts the key on a short cooldown, and retries on the next model in your fallback chain (up to 20 attempts).
-- **Per-key rate tracking** — RPM, RPD, TPM, and TPD counters per `(platform, model, key)` so the router always picks a key that's under its caps.
+- **Tool calling** — OpenAI-style `tools` / `tool_choice` requests are passed through, and assistant `tool_calls` + `tool` role follow-up messages round-trip across providers. Models that emit tool calls as plain text instead of structured JSON are rescued into real `tool_calls` automatically, and tool requests only route to models that actually support them.
+- **Structured outputs & full sampling passthrough** — `response_format` (`json_object` / `json_schema`, translated to Gemini's native `responseSchema`), plus `seed`, `top_k`, `min_p`, presence/frequency/repetition penalties, `logit_bias`, `logprobs`, and the `max_completion_tokens` alias. Params a provider is known to reject are dropped per platform (Mistral's strict API, Groq's logprobs family…), and every model advertises its honest list in `/v1/models` `supported_parameters`.
+- **Embeddings** — `/v1/embeddings` with family-based routing, including custom OpenAI-compatible embedding endpoints: failover only ever happens between providers serving the *same* model (vectors from different models are incompatible), never across models. See [Embeddings](#embeddings).
+- **Automatic fallover** — If the chosen provider returns a 429, 5xx, or times out, the router skips it, puts the key on a short cooldown, and retries on the next model in your fallback chain (up to 20 attempts, bounded by a wall-clock retry budget). A dead key rotates to its siblings instead of failing the request, and exhaustion errors carry the full attempt trail so you can see exactly what was tried.
+- **Smart routing, six strategies** — the chain is ranked by a selectable strategy: `priority` (your manual order), `balanced`, `smartest`, `fastest`, `reliable`, or `custom` with your own weight mix. Scores come from live per-model measurements (speed, capability, rate-limit headroom, recent errors) with a Thompson-sampling bandit under the hood; one-click sort presets reorder the chain from the dashboard.
+- **Unified models** — the same logical model served by several providers (say, GLM-4.7 on Cloudflare and Z.ai) collapses into one entry: one name in `/v1/models`, strict in-group failover between its providers, and merge/split overrides when the grouping guesses wrong.
+- **Model profiles** — save named fallback-chain configurations (a coding chain, a long-context chain, a vision chain) and switch the active one from the dashboard.
+- **Per-key rate tracking** — RPM, RPD, TPM, and TPD counters per `(platform, model, key)` so the router always picks a key that's under its caps. The ledger also learns: ceilings a provider reports in error bodies or quota headers (a Groq 413 naming its TPM limit) tighten the router's own limits automatically.
 - **Sticky sessions** — Multi-turn conversations keep talking to the same model for 30 minutes to avoid the hallucination spike that comes from mid-conversation model switches.
+- **Response cache (opt-in)** — an exact-match in-memory LRU for identical non-streaming requests: canonical SHA-256 keys over the full request, TTL and temperature gates, per-request `X-FreeLLM-Cache: on|off` override, and saved-token stats on the dashboard. Off by default; cache hits consume zero provider quota.
 - **Encrypted key storage** — API keys are encrypted with AES-256-GCM before hitting SQLite; decryption happens in-memory just before a request.
+- **Key import & export** — bulk-import keys by pasting a `.env` file (with preview and per-key selection), export back out as JSON, `.env`, or CSV.
 - **Unified API key** — Clients authenticate to your proxy with a single `freellmapi-…` bearer token. You never expose upstream provider keys to your apps.
 - **Dashboard login** — The admin UI and all `/api/*` routes are gated behind an email + password account (scrypt-hashed, session-token auth), set on first run. The `/v1` proxy keeps its own unified-key auth for apps.
 - **Health checks** — Periodic probes mark keys as `healthy`, `rate_limited`, `invalid`, or `error` so the router skips dead ones automatically.
 - **Admin dashboard** — React + Vite UI to manage keys, reorder the fallback chain, inspect analytics, and run prompts in a playground. Dark mode included.
-- **Analytics** — Per-request logging with latency, token counts, success rate, and per-provider breakdowns.
+- **Analytics** — Per-request logging with latency (p50 / p95 and time-to-first-token for streams), token counts, success rate, estimated cost savings, and per-provider / per-model / per-key breakdowns over 24h to 90d windows.
+- **Interactive API docs** — `GET /v1/docs` serves a dependency-free OpenAPI viewer covering every proxy endpoint; the spec itself lives at `GET /v1/openapi.json`.
+- **MCP server** — `POST /mcp` speaks the Model Context Protocol (Streamable HTTP), so MCP-capable agents can ask the router which free models are usable right now (with per-model `supported_parameters`), check provider/key health and cooldowns, read usage and cache stats, and switch the routing strategy mid-session. See [Coding agents](#coding-agents).
+- **Encrypted DB backups** — optional periodic encrypted snapshots of the SQLite database to a local path or HTTP target, restored automatically on a fresh boot (`FREEAPI_DB_BACKUP_*` env vars).
 - **Context handoff on model switch** — Optional. When a session falls over to a different model, injects one compact system message so the new model knows it is continuing an existing task. Disabled by default; enable with `FREELLMAPI_CONTEXT_HANDOFF=on_model_switch`. See [Context Handoff](#context-handoff).
 - **Runs anywhere Node 20+ runs** — Windows, macOS, Linux servers, or a small ARM SBC (Raspberry Pi included). ~40 MB RSS at idle behind PM2 / systemd / whatever supervisor you prefer.
 
@@ -104,9 +121,6 @@ Plus a **custom** provider — point at any OpenAI-compatible endpoint (llama.cp
 
 The scope is deliberately narrow. If a feature isn't on this list and isn't below, assume it isn't there yet.
 
-- **Image generation** (`/v1/images/*`)
-- **Audio / speech** (`/v1/audio/*`)
-- **Legacy completions** (`/v1/completions`) — only the chat endpoint is implemented
 - **Moderation** (`/v1/moderations`)
 - **`n > 1`** (multiple completions per request)
 - **Per-user billing / multi-tenant auth** — single-user by design
@@ -123,10 +137,15 @@ curl -fsSL https://freellmapi.co/install.sh | bash
 
 Prefer to read before you pipe to bash? [The script is here](https://freellmapi.co/install.sh). Re-running it is safe: your `.env` (and encryption key) is preserved and the container updates to `:latest`. Override the defaults with `FREELLMAPI_DIR`, `PORT`, or `HOST_BIND` env vars.
 
+On Windows, the easiest path is the desktop **[`.exe` installer from Releases](https://github.com/tashfeenahmed/freellmapi/releases/latest)** (below); the Docker steps work in WSL or any bash shell.
+
+On Android, see the experimental [Termux installation guide](docs/install/android-termux.md). It uses Node's built-in SQLite driver and does not require the Android NDK.
+
 **Or manually with Docker Compose.** It runs the API and dashboard together on port 3001 and persists SQLite in a named volume.
 
 **Prerequisites:** Docker, Docker Compose, OpenSSL.
 
+*On macOS / Linux (Bash):*
 ```bash
 git clone https://github.com/tashfeenahmed/freellmapi.git
 cd freellmapi
@@ -138,7 +157,21 @@ printf "ENCRYPTION_KEY=%s\nPORT=3001\n" "$ENCRYPTION_KEY" > .env
 docker compose up -d
 ```
 
+*On Windows (PowerShell):*
+```powershell
+git clone https://github.com/tashfeenahmed/freellmapi.git
+cd freellmapi
+
+$Bytes = New-Object Byte[] 32
+[Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($Bytes)
+$ENCRYPTION_KEY = -join ($Bytes | ForEach-Object { "{0:x2}" -f $_ })
+"ENCRYPTION_KEY=$ENCRYPTION_KEY`nPORT=3001" | Out-File -Encoding utf8 .env
+docker compose up -d
+```
+
 Open http://localhost:3001, add your provider keys on the **Keys** page, reorder the **Fallback Chain** to taste, and grab your unified API key from the **Keys** page header. That unified key is what you point your OpenAI SDK at.
+
+Your install keeps itself updated from the signed catalog feed. The current full catalog is listed at [freellmapi.co/models](https://freellmapi.co/models.html).
 
 > **Reaching it from another machine?** By default the container is published only on `127.0.0.1`, so `http://<server-ip>:3001` won't load from another device (the page just hangs). To expose it on your LAN — e.g. a Raspberry Pi at `http://192.168.1.x:3001` — start it with `HOST_BIND=0.0.0.0`:
 >
@@ -152,25 +185,73 @@ Open http://localhost:3001, add your provider keys on the **Keys** page, reorder
 
 **Prerequisites:** Node.js 20+, npm.
 
+*On macOS / Linux (Bash):*
 ```bash
 git clone https://github.com/tashfeenahmed/freellmapi.git
 cd freellmapi
 npm install
-cp .env.example .env
 ENCRYPTION_KEY="$(node -e 'console.log(require("crypto").randomBytes(32).toString("hex"))')"
 printf "ENCRYPTION_KEY=%s\nPORT=3001\n" "$ENCRYPTION_KEY" > .env
 npm run dev
 ```
 
-`ENCRYPTION_KEY` is required for startup. The server only falls back to a
-database-stored development key when `DEV_MODE=true` and `NODE_ENV` is not
-`production`; do not use that fallback with real provider keys.
+*On Windows (PowerShell):*
+```powershell
+git clone https://github.com/tashfeenahmed/freellmapi.git
+cd freellmapi
+npm install
+$ENCRYPTION_KEY = node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+"ENCRYPTION_KEY=$ENCRYPTION_KEY`nPORT=3001" | Out-File -Encoding utf8 .env
+npm run dev
+```
+
+`ENCRYPTION_KEY` is required for startup. When `NODE_ENV` is not `production`
+and it is unset, the server auto-generates a development key and saves it to a
+`.encryption-key` file (0600) next to the SQLite database, not inside it. Older
+installs that kept the key in the database are migrated to this file on first
+boot. Do not rely on that fallback with real provider keys; set `ENCRYPTION_KEY`.
 
 Request analytics are retained for 90 days or 100000 request rows by default,
 whichever limit prunes first. Set `REQUEST_ANALYTICS_RETENTION_DAYS=0` or
 `REQUEST_ANALYTICS_MAX_ROWS=0` in `.env` to disable either retention limit.
 
 Open http://localhost:5173 (the Vite dev UI), add your provider keys on the **Keys** page, reorder the **Fallback Chain** to taste, and grab your unified API key from the **Keys** page header. That unified key is what you point your OpenAI SDK at.
+
+### Declarative startup config
+
+For repeatable Docker/server installs, FreeLLMAPI can apply a JSON config on
+every boot. Set `FREEAPI_CONFIG_PATH=/path/to/freellmapi.config.json` or put the
+same JSON in `FREEAPI_CONFIG_JSON`. The config is idempotent: existing keys,
+custom providers, model edits, fallback rows, and routing settings are updated
+instead of duplicated.
+
+```json
+{
+  "keys": [
+    { "platform": "groq", "key": "gsk_...", "label": "main" },
+    { "platform": "google", "key": "AIza...", "enabled": true }
+  ],
+  "customProviders": [
+    {
+      "baseUrl": "http://host.docker.internal:11434/v1",
+      "label": "Ollama",
+      "models": [
+        { "model": "llama3.1:8b", "displayName": "Local Llama", "supportsTools": true }
+      ]
+    }
+  ],
+  "models": [
+    {
+      "platform": "groq",
+      "modelId": "llama-3.3-70b-versatile",
+      "displayName": "Llama 3.3 70B",
+      "supportsTools": true,
+      "fallbackEnabled": true
+    }
+  ],
+  "routing": { "strategy": "balanced" }
+}
+```
 
 > **Reaching the dev UI from another device on your LAN?** Use `npm run dev:lan` — it passes `--host` through to Vite, which then prints a `Network: http://<your-ip>:5173` URL you can open from a phone or another machine. (Plain `npm run dev -- --host` does *not* work here: the root `dev` script is a `concurrently` wrapper, so the flag never reaches Vite.) API calls go through Vite's dev proxy, so no extra server config is needed.
 
@@ -200,7 +281,26 @@ docker compose logs -f freellmapi
 
 By default the container's port is bound to `127.0.0.1` (localhost only). To reach the dashboard/API from another machine on your network, publish it on all interfaces with `HOST_BIND=0.0.0.0 docker compose up -d` — only on a trusted LAN, since the proxy is single-user.
 
-SQLite data is stored in the `freellmapi-data` volume at `/app/server/data`. Keep the same `.env` `ENCRYPTION_KEY` and volume when upgrading, because provider keys are encrypted at rest.
+SQLite data is stored in the `freellmapi-data` volume at `/app/server/data`.
+Keep the same `.env` `ENCRYPTION_KEY` and volume when upgrading, because
+provider keys are encrypted at rest. If your host only persists a specific
+directory, set `FREEAPI_DB_PATH=/that/path/freellmapi.db`.
+
+On hosts with ephemeral disks, configure an encrypted backup target:
+
+```env
+FREEAPI_DB_BACKUP_PATH=/app/server/data/freellmapi.db.backup
+# or:
+FREEAPI_DB_BACKUP_URL=https://example.com/freellmapi.db.backup
+FREEAPI_DB_BACKUP_TOKEN=optional-bearer-token
+FREEAPI_DB_BACKUP_KEY=64-char-hex-backup-key
+FREEAPI_DB_BACKUP_INTERVAL_MS=300000
+```
+
+When the database file is missing at startup, FreeLLMAPI restores the backup
+before migrations run. While the server is running it uploads a fresh encrypted
+backup periodically. If `FREEAPI_DB_BACKUP_KEY` is omitted, the app uses
+`ENCRYPTION_KEY` for the backup envelope too.
 
 More Docker operations and examples live in [docker/README.md](./docker/README.md).
 
@@ -212,99 +312,145 @@ request stats.
 
 ![FreeLLMAPI desktop app](repo-assets/desktop.png)
 
-**[Download the macOS app from Releases](https://github.com/tashfeenahmed/freellmapi/releases/latest)**, or build it from this repo in a few minutes:
+**[Download from Releases](https://github.com/tashfeenahmed/freellmapi/releases/latest)** — the macOS `.dmg` and the Windows `.exe` installer are built and attached to every release by the [`desktop-release`](.github/workflows/desktop-release.yml) workflow. Or build it from this repo in a few minutes:
+
+> **Note for Windows users building from source:** Building the desktop app requires compiling native SQLite modules for Electron. You must have [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) installed (specifically the "Desktop development with C++" workload) and Python installed before running `npm install`.
 
 ```bash
 npm install
-npm run desktop:dist        # macOS: desktop/dist-electron/FreeLLMAPI-…-arm64.dmg
-npm run desktop:dist:win    # Windows installer
+npm install --prefix desktop  # install desktop dependencies
+npm run desktop:dist          # macOS  → desktop/dist-electron/FreeLLMAPI-…-arm64.dmg
+npm run desktop:dist:win      # Windows → "desktop/dist-electron/FreeLLMAPI Setup ….exe"
 ```
 
-> **Windows:** the build config is in place but not tested yet — if you try it,
-> a quick report (working or not) in an issue would be much appreciated.
+> Locally built apps are unsigned, so Windows SmartScreen may warn on first run
+> ("More info" → "Run anyway"); the macOS build launches without Gatekeeper prompts.
+> Full instructions in [desktop/README.md](./desktop/README.md).
+
+### Credentials and where your data lives
+
+The desktop app has **no username or password to set up**. Unlike the server
+(which gates its dashboard behind an email + password account), the desktop
+build signs the dashboard in automatically with a hidden local account, so
+you're never prompted for credentials and never need one.
+
+The only credential you need is your **unified API key** — the
+`freellmapi-…` token your OpenAI/Anthropic client points at. Get it from:
+
+- the tray popover — click the tray icon, then **Copy Key**, or
+- the dashboard **Keys** page header (tray → **Open Dashboard**).
+
+You do not need to open or edit `freeapi.db` by hand.
+
+Your settings and data live in one folder per OS (copy it to migrate to
+another machine or into a container):
+
+| OS | Location |
+|----|----------|
+| Windows | `%APPDATA%\FreeLLMAPI\` (e.g. `C:\Users\<you>\AppData\Roaming\FreeLLMAPI\`) |
+| macOS | `~/Library/Application Support/FreeLLMAPI/` |
+| Linux | `~/.config/FreeLLMAPI/` |
+
+That folder holds `freeapi.db` (all keys, models, settings, encrypted at rest)
+and `config.json` (window/theme/port/LAN preferences). Copy both to move an
+install. For the server (non-desktop) deployment, the equivalent state is the
+`.env` file and the SQLite DB at `server/data/freeapi.db` (or wherever
+`FREEAPI_DB_PATH` points).
+
+## Languages
+
+The dashboard and the desktop tray ship in 6 languages. The UI auto-detects your
+browser/system language on first load and you can switch any time from the **⋯**
+menu; the choice is remembered.
+
+| Language | Locale |
+| --- | --- |
+| English | `en` |
+| 中文 (简体) | `zh-CN` |
+| Français | `fr` |
+| Español | `es` |
+| Português (Brasil) | `pt-BR` |
+| Italiano | `it` |
+
+Translations live in [`client/src/i18n/locales/`](./client/src/i18n/locales) as
+flat JSON files. To add a language, copy `en.json`, translate the values, and
+register the locale in `client/src/i18n/I18nProvider.tsx` (and
+`desktop/src/i18n.ts` for the tray strings) — PRs welcome.
+
+## Works with OpenAI-compatible clients
+
+Any client that can target an OpenAI-compatible base URL can use FreeLLMAPI:
+
+- **LangChain, LlamaIndex, official OpenAI SDKs**: set `base_url` to
+  `http://localhost:3001/v1` and use the unified key from the dashboard.
+- **Local GPU boxes**: add custom OpenAI-compatible endpoints for Ollama,
+  llama.cpp, LM Studio, vLLM, or an internal gateway.
+
+### Coding agents
+
+Every recipe below is the same three facts in a different config file: base URL
+`http://localhost:3001/v1`, the unified key from the dashboard's Keys page, and
+a model (`auto` lets the router pick).
+
+| Agent | Setup |
+| --- | --- |
+| **Claude Code** | `ANTHROPIC_BASE_URL=http://localhost:3001` + `ANTHROPIC_AUTH_TOKEN=<unified key>` — full walkthrough in [Anthropic / Claude clients](#anthropic--claude-clients) |
+| **Codex CLI** | add a provider in `~/.codex/config.toml` with `base_url = "http://localhost:3001/v1"` and its `env_key` pointing at the unified key — the `/v1/responses` surface it needs is implemented |
+| **Cline / Roo Code** | provider type "OpenAI Compatible", base URL `http://localhost:3001/v1`, unified key, model `auto` (or any id from `/v1/models`) |
+| **Continue** | `apiBase: http://localhost:3001/v1` in its config; inline autocomplete works too via the legacy `/v1/completions` surface |
+| **Aider** | `OPENAI_API_BASE=http://localhost:3001/v1` + `OPENAI_API_KEY=<unified key>`, then `aider --model openai/auto` |
+| **opencode** | OpenAI-compatible provider with the same base URL and key |
+| **Cursor** | paste the unified key under a custom OpenAI base URL — but note Cursor verifies and calls the API **from its servers**, so your router must be reachable from the internet (a tunnel or a host with a public address), not just `localhost` |
+
+On top of inference, the router is an **MCP server**: agents can introspect it mid-session
+(usable models and the params each one honors, provider health, usage and cache stats,
+routing strategy). For Claude Code:
+
+```bash
+claude mcp add --transport http freellmapi http://localhost:3001/mcp \
+  --header "Authorization: Bearer freellmapi-your-unified-key"
+```
+
+Any MCP client that speaks Streamable HTTP works the same way: point it at `/mcp` with the
+unified key as a Bearer token.
+
+FreeLLMAPI is local-first and single-user by design. Your provider keys stay in
+your SQLite database, encrypted at rest, and requests go from your machine to the
+upstream providers you enabled.
 
 ## Premium (live catalog)
 
 The router keeps its model catalog fresh on its own: it pulls a signed catalog
 from [freellmapi.co](https://freellmapi.co) twice a day and applies new models,
-quota changes, and provider quirk fixes to your local DB (your own enable/disable
-choices and custom providers are never touched; every download is verified
-against a pinned Ed25519 key before it is applied).
+quota changes, and provider quirk fixes to your local DB. Your own
+enable/disable choices and custom providers are never touched, and every
+download is verified against a pinned Ed25519 key before it is applied.
 
-- **Free** installs follow a **monthly snapshot** — zero cost, forever.
-- **[Premium](https://freellmapi.co/#pricing)** ($19/yr or $49 lifetime) follows
-  the **live feed**, refreshed every 2-3 days, so new free models are in your
-  router the moment they exist. One key covers all your devices; activate it in
-  the dashboard under **Premium**. Cancel or manage billing self-serve at
-  [freellmapi.co/manage](https://freellmapi.co/manage).
+The catalog currently tracks **28 providers**, **235 model families**, **339
+provider/model endpoints**, and roughly **4 billion tokens per month** of listed
+free-tier capacity. Browse the full set at
+**[freellmapi.co/models](https://freellmapi.co/models.html)**.
+
+Premium keeps that signed catalog live on every router you run. When a provider
+launches a strong free model, quietly tightens a quota, or breaks a wire format,
+live-feed routers receive the update as soon as we ship it.
+
+**[Go live at freellmapi.co →](https://freellmapi.co/?utm_source=github&utm_medium=readme&utm_campaign=premium&utm_content=readme_bottom#pricing)**
+
+- $19/year or $49 once, lifetime. Stripe checkout; cancel anytime, self-serve.
+- One `fla_` key covers every router you run: desktop, homelab, Raspberry Pi.
+- Activate in the dashboard under **Premium**; cancel or manage billing
+  self-serve at [freellmapi.co/manage](https://freellmapi.co/manage).
+- The router itself stays MIT-licensed and fully free, forever. Premium is only
+  the live feed, and it's what funds the daily model testing and catalog
+  maintenance that keeps the catalog working.
 
 The catalog server never sees your prompts, completions, or provider keys — the
 router stays fully self-hosted either way.
 
-Locally built apps launch without Gatekeeper/SmartScreen warnings — no code
-signing involved. Full instructions in [desktop/README.md](./desktop/README.md).
-
-### Testing Premium locally (development only)
-
-For development and testing, you can generate a test Premium license without leaving your local machine:
-
-**Option 1: Via UI button (Recommended)**
-```bash
-cd server && npm run dev
-# (in another terminal)
-cd client && npm run dev
-# Open http://localhost:5173 → Premium page → "Developer Tools" → button
-```
-
-**Option 2: Via CLI (faster)**
-```bash
-cd server
-npm run gen-test-license          # Lifetime (default)
-npm run gen-test-license:annual   # Annual (1 year)
-npm run dev
-# (in another terminal) cd client && npm run dev
-```
-
-Generated test keys are marked `fla_dev_*` and only work in development mode (`NODE_ENV !== 'production'`).
-
-**Verification**: On the Premium page, you should see:
-- 🟢 **Catalog feed**: "Live feed" (not "Monthly snapshot")
-- 🟢 **License**: Green badge "Premium Lifetime" (or "Premium Annual")
-- 🟢 **Last checked**: Recent timestamp
-
-**Implementation details**:
-- Route admin endpoint: `POST /api/premium/admin/generate-test-key` (dev-only)
-- Modified files: `server/src/routes/premium.ts`, `client/src/pages/PremiumPage.tsx`, `server/package.json`
-- New files: `server/scripts/generate-test-license.mjs` (CLI generator)
-
-**Security**:
-- ✅ Endpoint blocked in production (returns 403 if `NODE_ENV=production`)
-- ✅ Test keys clearly identified as dev keys (`fla_dev_` prefix)
-- ✅ UI button invisible in production
-- ✅ No external network calls; keys are completely local
-- ✅ Easy to reset: delete `server/data/freeapi.db` and regenerate
-
-**Scenarios**:
-| Scenario | How |
-|----------|-----|
-| Test UI Premium | Click button in interface |
-| Test live catalog sync | Click "Check for updates" |
-| Test Annual plan | `npm run gen-test-license:annual` |
-| Test Lifetime plan | `npm run gen-test-license` |
-| Remove test key | Premium page → "Remove key from this device" |
-| Reset everything | `rm -r server/data/freeapi.db*` then regenerate |
-| Test offline | Generate key, disconnect internet; catalog stays cached |
-
-**Troubleshooting**:
-- **No "Developer Tools" button**: Verify `NODE_ENV !== 'production'`; try hard refresh (`Ctrl+Shift+R`)
-- **Route returns 403**: You're in production mode; check `NODE_ENV`
-- **License doesn't activate**: Ensure you're authenticated to the dashboard; check browser console
-- **Catalog stays "Monthly snapshot"**: Click "Check for updates"; wait a few seconds; check server console for `[catalog-sync]` messages
-- **Key won't register**: Verify file permissions on `server/data/freeapi.db`; reset and retry
-
 ## Using the API
 
-Any OpenAI-compatible client works. Examples:
+Any OpenAI-compatible client works (Anthropic / Claude clients too — see [Anthropic / Claude clients](#anthropic--claude-clients)). Examples:
 
 **Python**
 
@@ -336,6 +482,42 @@ curl http://localhost:3001/v1/chat/completions \
   }'
 ```
 
+**Routing strategies (`auto:*`)**
+
+Plain `auto` follows your active fallback chain. Add a suffix to steer a single request instead — no dashboard changes needed:
+
+- `auto:smart` — favor the highest-intelligence models
+- `auto:fast` — favor measured speed (throughput and time-to-first-byte)
+- `auto:cheap` — budget-leaning; currently the same blend as `balanced` (everything in the pool is already free)
+- `auto:reliable` — favor recent success rate
+- `auto:balanced` — the default blend (reliability first, speed and intelligence split the rest)
+
+These rank **every enabled model**, ignoring your chain order. Common synonyms resolve too (`auto:fastest`, `auto:speed`, `auto:smartest`, `auto:cheapest`, `auto:budget`, …), and the whole model string is case-insensitive.
+
+```bash
+curl http://localhost:3001/v1/chat/completions \
+  -H "Authorization: Bearer freellmapi-your-unified-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto:fast",
+    "messages": [{"role": "user", "content": "hi"}]
+  }'
+```
+
+`auto:<profile-name>` routes through a named profile's chain instead of the active one, so different tools can use different chains through the same key:
+
+```bash
+curl http://localhost:3001/v1/chat/completions \
+  -H "Authorization: Bearer freellmapi-your-unified-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto:coding",
+    "messages": [{"role": "user", "content": "Write a binary search in Rust."}]
+  }'
+```
+
+An unknown profile name returns a clear `400` rather than silently falling back. Profiles are the named fallback chains from **Model profiles** (see [Features](#features)) — create and switch them from the dashboard; whichever is active is what plain `auto` uses.
+
 **Streaming**
 
 ```python
@@ -346,6 +528,22 @@ stream = client.chat.completions.create(
 )
 for chunk in stream:
     print(chunk.choices[0].delta.content or "", end="", flush=True)
+```
+
+**VS Code ghost-text autocomplete (Continue)**
+
+FreeLLMAPI exposes `/v1/completions` for editor autocomplete clients that send legacy OpenAI prompt/suffix requests. Example Continue config:
+
+```yaml
+models:
+  - name: FreeLLMAPI Autocomplete
+    provider: openai
+    model: auto
+    apiBase: http://localhost:3001/v1
+    apiKey: freellmapi-your-unified-key
+    useLegacyCompletionsEndpoint: true
+    roles:
+      - autocomplete
 ```
 
 **Tool calling**
@@ -386,6 +584,19 @@ final = client.chat.completions.create(
     tools=tools,
 )
 print(final.choices[0].message.content)
+```
+
+**Gemini Google Search grounding**
+
+Google's models can ground their answers in live Google Search results. Since the OpenAI wire format has no way to express that, request a tool named `google_search` and the Google provider translates it into Gemini's native grounding tool. It can be sent on its own or alongside your normal function tools.
+
+```python
+resp = client.chat.completions.create(
+    model="gemini-2.5-flash",  # pin a Google model so the request routes there
+    messages=[{"role": "user", "content": "Who won the F1 race this weekend?"}],
+    tools=[{"type": "function", "function": {"name": "google_search", "parameters": {}}}],
+)
+print(resp.choices[0].message.content)
 ```
 
 **Vision / image input**
@@ -448,6 +659,42 @@ curl http://localhost:3001/v1/embeddings \
 
 The default family, per-provider toggles, and priorities live on the dashboard's **Models → Embeddings** page. Pick your family once and stick with it for a given vector store — that's the whole point of the family model.
 
+### Anthropic / Claude clients
+
+FreeLLMAPI also speaks Anthropic's Messages API, so anything built for Claude — including **Claude Code** and the official Anthropic SDKs — can run against your free pool. Point the client at your server's **origin** (Anthropic clients append `/v1/messages` themselves) and authenticate with your unified key. Both `x-api-key` and `Authorization: Bearer` are accepted.
+
+```bash
+curl http://localhost:3001/v1/messages \
+  -H "x-api-key: freellmapi-your-unified-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 256,
+    "messages": [{"role": "user", "content": "hi"}]
+  }'
+```
+
+Claude model names map to your free pool on the **Keys → Anthropic** tab: each family (`default`, `opus`, `sonnet`, `haiku`) routes to `auto` (the router picks a free model) or a model you pin. `POST /v1/messages/count_tokens` and a content-negotiated `GET /v1/models` (Anthropic shape when `anthropic-version` is sent) are implemented too. Streaming, system prompts, tool use, and image input all translate across the same router as the OpenAI endpoints.
+
+**Claude Code** — point it at your server and start it:
+
+*On macOS / Linux (Bash):*
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:3001
+export ANTHROPIC_AUTH_TOKEN=freellmapi-your-unified-key   # NOT ANTHROPIC_API_KEY
+claude
+```
+
+*On Windows (PowerShell):*
+```powershell
+$env:ANTHROPIC_BASE_URL="http://localhost:3001"
+$env:ANTHROPIC_AUTH_TOKEN="freellmapi-your-unified-key"
+claude
+```
+
+> Use `ANTHROPIC_AUTH_TOKEN` (sent as a Bearer token), **not** `ANTHROPIC_API_KEY` — Claude Code treats a set `ANTHROPIC_API_KEY` as a conflicting first-party credential and refuses to start.
+
 ## Screenshots
 
 ### Keys
@@ -464,7 +711,7 @@ Send a chat completion through the router and see which provider served it, with
 
 ### Analytics
 
-Request volume, success rate, tokens in and out, average latency, and per-provider breakdowns over 24h / 7d / 30d windows.
+Request volume, success rate, tokens in and out, average latency, and per-provider breakdowns over 24h / 7d / 30d / 90d windows.
 
 ![Analytics page](repo-assets/analytics.png)
 
@@ -488,7 +735,7 @@ Request volume, success rate, tokens in and out, average latency, and per-provid
                                           │
    ┌──────────────┬────────────┬──────────┴─────────┬─────────────┬──────────┐
    ▼              ▼            ▼                    ▼             ▼          ▼
- Google         Groq        Cerebras           OpenRouter        HF       …10 more
+ Google         Groq        Cerebras           OpenRouter        HF       …22 more
 ```
 
 - **Router** (`server/src/services/router.ts`) — picks a model per request.
@@ -537,16 +784,16 @@ Stacking free tiers has real trade-offs. Be honest with yourself about them:
 - **No frontier models.** The free-tier catalog tops out around Llama 3.3 70B, GLM-4.5, Qwen 3 Coder, and Gemini 2.5 Pro. You will not get GPT-5 or Claude Opus class reasoning through this. For hard problems, pay for a real API.
 - **Intelligence degrades as the day progresses.** Your top-ranked models (usually Gemini 2.5 Pro, GPT-4o via GitHub Models) have the lowest daily caps. Once they hit their limits, the router falls down your priority chain to smaller/weaker models. Expect the effective intelligence of the endpoint to drop in the late hours of each day — then reset at UTC midnight.
 - **Latency is highly variable.** Cerebras and Groq are extremely fast; others are not. You get whichever one is available.
-- **Free tiers can change without notice.** Providers regularly tighten, loosen, or remove free tiers. When that happens you'll see 429s or auth errors until you update the catalog. Re-seed scripts live in `server/src/scripts/`.
+- **Free tiers can change without notice.** Providers regularly tighten, loosen, or remove free tiers. When that happens you'll see 429s or auth errors until the catalog update reaches you — live-feed installs get those fixes within days, free installs on the 30-day trail. Re-seed scripts live in `server/src/scripts/`.
 - **No SLA, by definition.** If you need reliability, use a paid provider with a contract.
 - **Local-first.** There's no multi-tenant auth. Run this for yourself; don't expose it to the internet.
 
 ## Contributing
 
-Contributors very welcome! Good first PRs:
+Contributors very welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for the dev loop, PR expectations, and the policy on AI/LLM-assisted contributions (short version: welcome, same quality bar as any other PR). Good first PRs:
 
 - **Add a provider** — copy `server/src/providers/openai-compat.ts` as a template, wire it into `server/src/providers/index.ts`, seed its models in `server/src/db/index.ts`, add a test in `server/src/__tests__/providers/`.
-- **Add an endpoint** — images, moderations, audio. The provider base class can grow new methods; adapters declare which they support.
+- **Add an endpoint** — moderations and other OpenAI-compatible surfaces. The provider base class can grow new methods; adapters declare which they support.
 - **Improve the router** — cost-aware routing (cheapest-healthy-fastest tradeoffs), better latency-weighted priority, regional pinning.
 - **Dashboard polish** — charts on the Analytics page, key rotation UX, batch import of keys from `.env`.
 - **Docs** — more examples, client library snippets for Go/Rust/etc., a deployment recipe for Docker or Fly.
@@ -560,7 +807,17 @@ npm test         # server vitest; also runs client tests if the workspace adds t
 npm run build    # compile server and dashboard
 ```
 
-PRs should include a test, keep the existing test suite green, and match the `.editorconfig` / tsconfig defaults already in the repo. Issues and discussions are open.
+PRs should include a test, keep the existing test suite green, and match the `.editorconfig` / tsconfig defaults already in the repo. See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full contributor workflow.
+
+### Database Migrations
+
+In local development, apply pending migrations with:
+
+```bash
+NODE_ENV=development npm run db:migration:up
+```
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full migration CLI and workflow.
 
 ### Contributors
 
@@ -569,7 +826,10 @@ PRs should include a test, keep the existing test suite green, and match the `.e
 <a href="https://github.com/VinhPhamAI"><img src="https://images.weserv.nl/?url=github.com/VinhPhamAI.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@VinhPhamAI" /></a>
 <a href="https://github.com/deadc"><img src="https://images.weserv.nl/?url=github.com/deadc.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@deadc" /></a>
 <a href="https://github.com/zhangyu1324"><img src="https://images.weserv.nl/?url=github.com/zhangyu1324.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@zhangyu1324" /></a>
-<a href="https://github.com/Tazrif-Raim"><img src="https://images.weserv.nl/?url=github.com/Tazrif-Raim.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@Tazrif-Raim" /></a>
+<a href="https://github.com/chongjiazhen"><img src="https://images.weserv.nl/?url=github.com/chongjiazhen.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@chongjiazhen" /></a>
+<a href="https://github.com/vjsai"><img src="https://images.weserv.nl/?url=github.com/vjsai.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@vjsai" /></a>
+<a href="https://github.com/long2ice"><img src="https://images.weserv.nl/?url=github.com/long2ice.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@long2ice" /></a>
+<a href="https://github.com/sadesguy"><img src="https://images.weserv.nl/?url=github.com/sadesguy.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@sadesguy" /></a>
 <a href="https://github.com/hodlmybeer69-bit"><img src="https://images.weserv.nl/?url=github.com/hodlmybeer69-bit.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@hodlmybeer69-bit" /></a>
 <a href="https://github.com/phoenixikkifullstack"><img src="https://images.weserv.nl/?url=github.com/phoenixikkifullstack.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@phoenixikkifullstack" /></a>
 <a href="https://github.com/jtbrennan-git"><img src="https://images.weserv.nl/?url=github.com/jtbrennan-git.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@jtbrennan-git" /></a>
@@ -579,6 +839,7 @@ PRs should include a test, keep the existing test suite green, and match the `.e
 <a href="https://github.com/danscMax"><img src="https://images.weserv.nl/?url=github.com/danscMax.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@danscMax" /></a>
 <a href="https://github.com/jhash"><img src="https://images.weserv.nl/?url=github.com/jhash.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@jhash" /></a>
 <a href="https://github.com/JammyJames1234"><img src="https://images.weserv.nl/?url=github.com/JammyJames1234.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@JammyJames1234" /></a>
+<a href="https://github.com/coffcoe"><img src="https://images.weserv.nl/?url=github.com/coffcoe.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@coffcoe" /></a>
 <a href="https://github.com/Sumit4codes"><img src="https://images.weserv.nl/?url=github.com/Sumit4codes.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@Sumit4codes" /></a>
 <a href="https://github.com/meliani"><img src="https://images.weserv.nl/?url=github.com/meliani.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@meliani" /></a>
 <a href="https://github.com/thedavidweng"><img src="https://images.weserv.nl/?url=github.com/thedavidweng.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@thedavidweng" /></a>
@@ -599,8 +860,54 @@ PRs should include a test, keep the existing test suite green, and match the `.e
 <a href="https://github.com/RobinHoodO"><img src="https://images.weserv.nl/?url=github.com/RobinHoodO.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@RobinHoodO" /></a>
 <a href="https://github.com/hmm183"><img src="https://images.weserv.nl/?url=github.com/hmm183.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@hmm183" /></a>
 <a href="https://github.com/duemilionidieuro-bot"><img src="https://images.weserv.nl/?url=github.com/duemilionidieuro-bot.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@duemilionidieuro-bot" /></a>
+<a href="https://github.com/cagedbird043"><img src="https://images.weserv.nl/?url=github.com/cagedbird043.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@cagedbird043" /></a>
+<a href="https://github.com/jasnoorgill"><img src="https://images.weserv.nl/?url=github.com/jasnoorgill.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@jasnoorgill" /></a>
+<a href="https://github.com/Joey9024"><img src="https://images.weserv.nl/?url=github.com/Joey9024.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@Joey9024" /></a>
+<a href="https://github.com/AskingConical"><img src="https://images.weserv.nl/?url=github.com/AskingConical.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@AskingConical" /></a>
+<a href="https://github.com/ProAlit"><img src="https://images.weserv.nl/?url=github.com/ProAlit.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@ProAlit" /></a>
 <a href="https://github.com/hjhhoni"><img src="https://images.weserv.nl/?url=github.com/hjhhoni.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@hjhhoni" /></a>
 <a href="https://github.com/immanuelsavio"><img src="https://images.weserv.nl/?url=github.com/immanuelsavio.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@immanuelsavio" /></a>
+<a href="https://github.com/Slyker"><img src="https://images.weserv.nl/?url=github.com/Slyker.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@Slyker" /></a>
+<a href="https://github.com/wells1013"><img src="https://images.weserv.nl/?url=github.com/wells1013.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@wells1013" /></a>
+<a href="https://github.com/evgkrsk"><img src="https://images.weserv.nl/?url=github.com/evgkrsk.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@evgkrsk" /></a>
+<a href="https://github.com/aaronjmars"><img src="https://images.weserv.nl/?url=github.com/aaronjmars.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@aaronjmars" /></a>
+<a href="https://github.com/Robs87"><img src="https://images.weserv.nl/?url=github.com/Robs87.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@Robs87" /></a>
+<a href="https://github.com/dashitongzhi"><img src="https://images.weserv.nl/?url=github.com/dashitongzhi.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@dashitongzhi" /></a>
+<a href="https://github.com/QingJ01"><img src="https://images.weserv.nl/?url=github.com/QingJ01.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@QingJ01" /></a>
+<a href="https://github.com/3215"><img src="https://images.weserv.nl/?url=github.com/3215.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@3215" /></a>
+<a href="https://github.com/saifulaiub123"><img src="https://images.weserv.nl/?url=github.com/saifulaiub123.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@saifulaiub123" /></a>
+<a href="https://github.com/PietFourie"><img src="https://images.weserv.nl/?url=github.com/PietFourie.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@PietFourie" /></a>
+<a href="https://github.com/mhmdkrmabd"><img src="https://images.weserv.nl/?url=github.com/mhmdkrmabd.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@mhmdkrmabd" /></a>
+<a href="https://github.com/DemeulemeesterxMaxime"><img src="https://images.weserv.nl/?url=github.com/DemeulemeesterxMaxime.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@DemeulemeesterxMaxime" /></a>
+<a href="https://github.com/HoodBlah"><img src="https://images.weserv.nl/?url=github.com/HoodBlah.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@HoodBlah" /></a>
+<a href="https://github.com/SeanPedersen"><img src="https://images.weserv.nl/?url=github.com/SeanPedersen.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@SeanPedersen" /></a>
+<a href="https://github.com/andersmmg"><img src="https://images.weserv.nl/?url=github.com/andersmmg.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@andersmmg" /></a>
+<a href="https://github.com/chirag127"><img src="https://images.weserv.nl/?url=github.com/chirag127.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@chirag127" /></a>
+<a href="https://github.com/jasnoorgill"><img src="https://images.weserv.nl/?url=github.com/jasnoorgill.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@jasnoorgill" /></a>
+<a href="https://github.com/allababbot"><img src="https://images.weserv.nl/?url=github.com/allababbot.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@allababbot" /></a>
+<a href="https://github.com/johan-droid"><img src="https://images.weserv.nl/?url=github.com/johan-droid.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@johan-droid" /></a>
+<a href="https://github.com/redenfire"><img src="https://images.weserv.nl/?url=github.com/redenfire.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@redenfire" /></a>
+<a href="https://github.com/itzpingcat"><img src="https://images.weserv.nl/?url=github.com/itzpingcat.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@itzpingcat" /></a>
+<a href="https://github.com/kairwang01"><img src="https://images.weserv.nl/?url=github.com/kairwang01.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@kairwang01" /></a>
+<a href="https://github.com/gongjurenzhangwei"><img src="https://images.weserv.nl/?url=github.com/gongjurenzhangwei.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@gongjurenzhangwei" /></a>
+<a href="https://github.com/jsonring"><img src="https://images.weserv.nl/?url=github.com/jsonring.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@jsonring" /></a>
+<a href="https://github.com/1029734570"><img src="https://images.weserv.nl/?url=github.com/1029734570.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@1029734570" /></a>
+<a href="https://github.com/86TheCactus"><img src="https://images.weserv.nl/?url=github.com/86TheCactus.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@86TheCactus" /></a>
+<a href="https://github.com/AmiroKD"><img src="https://images.weserv.nl/?url=github.com/AmiroKD.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@AmiroKD" /></a>
+<a href="https://github.com/ecryptomillionaire-dev"><img src="https://images.weserv.nl/?url=github.com/ecryptomillionaire-dev.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@ecryptomillionaire-dev" /></a>
+<a href="https://github.com/4riful"><img src="https://images.weserv.nl/?url=github.com/4riful.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@4riful" /></a>
+<a href="https://github.com/cagedbird043"><img src="https://images.weserv.nl/?url=github.com/cagedbird043.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@cagedbird043" /></a>
+<a href="https://github.com/fix2015"><img src="https://images.weserv.nl/?url=github.com/fix2015.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@fix2015" /></a>
+<a href="https://github.com/iisyw"><img src="https://images.weserv.nl/?url=github.com/iisyw.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@iisyw" /></a>
+<a href="https://github.com/xsfhacg"><img src="https://images.weserv.nl/?url=github.com/xsfhacg.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@xsfhacg" /></a>
+<a href="https://github.com/noobix"><img src="https://images.weserv.nl/?url=github.com/noobix.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@noobix" /></a>
+<a href="https://github.com/nandukmelath"><img src="https://images.weserv.nl/?url=github.com/nandukmelath.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@nandukmelath" /></a>
+<a href="https://github.com/coffcoe"><img src="https://images.weserv.nl/?url=github.com/coffcoe.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@coffcoe" /></a>
+<a href="https://github.com/NirvanaCh7"><img src="https://images.weserv.nl/?url=github.com/NirvanaCh7.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@NirvanaCh7" /></a>
+<a href="https://github.com/Mohamed3nan"><img src="https://images.weserv.nl/?url=github.com/Mohamed3nan.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@Mohamed3nan" /></a>
+<a href="https://github.com/Arman-Espiar"><img src="https://images.weserv.nl/?url=github.com/Arman-Espiar.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@Arman-Espiar" /></a>
+<a href="https://github.com/MetaMysteries8"><img src="https://images.weserv.nl/?url=github.com/MetaMysteries8.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@MetaMysteries8" /></a>
+<a href="https://github.com/lujun880726"><img src="https://images.weserv.nl/?url=github.com/lujun880726.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@lujun880726" /></a>
 
 ## Terms of Service review
 
@@ -621,6 +928,7 @@ A self-hosted, single-user, personal-use setup was re-reviewed against each prov
 | Z.ai (api.z.ai) | ⚠️ Caution | New row — Singapore entity (distinct from Zhipu CN). §III.3(l) anti-traffic-redirect clause could plausibly be read against a proxy; no explicit personal-use carve-out. |
 | Ollama Cloud | ✅ Likely OK | New row — Free plan permits cloud-model access (1 concurrent, 5-hour session caps). No anti-proxy / anti-resale clauses found. *(Integration tracked in #14.)* |
 | OVH AI Endpoints | ✅ Likely OK | New row (June 2026) — anonymous access is officially documented (2 req/min per IP per model). OVH reserves the right to introduce token/consumption caps. |
+| AI Horde | ✅ Likely OK | New row (June 2026) — a free, community-powered commons run by the Haidra non-profit; anonymous use is officially supported (key `0000000000`, lowest queue priority). No anti-proxy / anti-resale clause. The OpenAI proxy is a pilot and may be restricted by usage. *(Integration #345.)* |
 
 Rules of thumb that keep most providers happy: **one account per provider**, **no reselling**, **no sharing your endpoint with other humans**, **don't hammer a free tier as a paid production backend**. This is informational, not legal advice — read each provider's ToS and make your own call.
 
@@ -629,10 +937,6 @@ Removed since the April 2026 review: Hugging Face, Moonshot, and MiniMax direct 
 ## Disclaimer
 
 **This project is for personal experimentation and learning, not production.** Free tiers exist so developers can prototype against them; they aren't a stable, supported inference substrate and shouldn't be treated as one. If you build something real on top of FreeLLMAPI, swap in a paid API before you ship. Your relationship with each upstream provider is governed by the terms you accepted when you created your account — those terms still apply when the traffic is proxied through this project, and you're responsible for complying with them.
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/chart?repos=tashfeenahmed/freellmapi&type=date&legend=top-left)](https://www.star-history.com/?repos=tashfeenahmed%2Ffreellmapi&type=date&legend=top-left)
 
 ## License
 

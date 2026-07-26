@@ -1,5 +1,6 @@
 import fs from 'fs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { initDb, getDb } from '../../db/index.js';
 import {
   canMakeRequest,
   canUseTokens,
@@ -8,9 +9,13 @@ import {
   getRateLimitStatus,
   getNextCooldownDuration,
   getCooldownDurationForLimit,
+  recentHitCount,
   canUseProvider,
+  canUseProviderTokens,
   providerDailyRequestCount,
   getProviderDailyRequestCap,
+  providerDailyTokenCount,
+  getProviderDailyTokenCap,
 } from '../../services/ratelimit.js';
 import { parseRetryAfterMs } from '../../providers/base.js';
 
@@ -131,12 +136,67 @@ describe('Rate Limiter', () => {
       expect(getCooldownDurationForLimit(...args, { rpd: 1000, tpd: null })).toBe(90 * 1000);
     });
 
-    it('treats a null daily limit as never-exhausted (always transient)', () => {
+    it('stays transient for the first 429 with null daily limits (heuristic threshold)', () => {
       const id = Math.floor(Math.random() * 1_000_000);
-      for (let i = 0; i < 50; i++) recordRequest('mistral', `nolimit-${id}`, id);
+      // 1st 429 → transient (no signal yet). Subsequent 429s stay transient
+      // until the threshold is crossed.
       expect(
         getCooldownDurationForLimit('mistral', `nolimit-${id}`, id, { rpd: null, tpd: null }),
       ).toBe(90 * 1000);
+    });
+
+    it('escalates null-limit 429s through the same ladder as documented RPD exhaustion', () => {
+      // Documented RPD path (see "escalates only once the daily request limit
+      // is actually reached"): 1st call after counter ≥ limit → 2min (idx=0),
+      // 2nd → 10min (idx=1), 3rd → HOUR (idx=2), 4th+ → DAY (idx=3).
+      //
+      // Null-limit path mirrors that sequence starting at the 2nd 429 (1st
+      // is transient — no signal yet). Uses an independent counter so the
+      // ladder index isn't inflated by the heuristic's own hits.
+      const id = Math.floor(Math.random() * 1_000_000);
+      const platform = 'ollama';
+      const model = `nolimit-esc-${id}`;
+      // 1st 429 — no history → transient
+      expect(getCooldownDurationForLimit(platform, model, id, { rpd: null, tpd: null })).toBe(90 * 1000);
+      // 2nd 429 — heuristic threshold (2) crossed → 2min (ladder idx=0)
+      expect(getCooldownDurationForLimit(platform, model, id, { rpd: null, tpd: null })).toBe(2 * 60 * 1000);
+      // 3rd 429 → 10min (idx=1)
+      expect(getCooldownDurationForLimit(platform, model, id, { rpd: null, tpd: null })).toBe(10 * 60 * 1000);
+      // 4th 429 → HOUR (idx=2)
+      expect(getCooldownDurationForLimit(platform, model, id, { rpd: null, tpd: null })).toBe(60 * 60 * 1000);
+      // 5th 429 → DAY (idx=3, capped)
+      expect(getCooldownDurationForLimit(platform, model, id, { rpd: null, tpd: null })).toBe(24 * 60 * 60 * 1000);
+      // 6th+ stays at DAY
+      expect(getCooldownDurationForLimit(platform, model, id, { rpd: null, tpd: null })).toBe(24 * 60 * 60 * 1000);
+    });
+
+    it('does NOT trigger the heuristic when limits are known (even after 5+ hits)', () => {
+      // rpd=1000 known: counters track it, daily-exhausted check uses the
+      // counter, not the hit count. The null-limits heuristic only fires
+      // when BOTH rpd AND tpd are null. With a known cap, repeated 429s
+      // stay transient (the counter-based path takes over instead).
+      const id = Math.floor(Math.random() * 1_000_000);
+      const platform = 'openrouter';
+      const model = `known-${id}`;
+      for (let i = 0; i < 5; i++) {
+        expect(getCooldownDurationForLimit(platform, model, id, { rpd: 1000, tpd: null })).toBe(90 * 1000);
+      }
+      expect(recentHitCount(platform, model, id, Date.now())).toBe(0);
+    });
+
+    it('clears null-limit hit history after a successful request', () => {
+      const id = Math.floor(Math.random() * 1_000_000);
+      const platform = 'ollama';
+      const model = `nolimit-success-${id}`;
+
+      expect(getCooldownDurationForLimit(platform, model, id, { rpd: null, tpd: null })).toBe(90 * 1000);
+      expect(getCooldownDurationForLimit(platform, model, id, { rpd: null, tpd: null })).toBe(2 * 60 * 1000);
+      expect(recentHitCount(platform, model, id, Date.now())).toBe(2);
+
+      recordRequest(platform, model, id);
+
+      expect(recentHitCount(platform, model, id, Date.now())).toBe(0);
+      expect(getCooldownDurationForLimit(platform, model, id, { rpd: null, tpd: null })).toBe(90 * 1000);
     });
 
     it('escalates only once the daily request limit is actually reached', () => {
@@ -229,6 +289,78 @@ describe('Rate Limiter', () => {
       expect(canUseProvider('openrouter', testId)).toBe(false); // 3 >= 3
     });
   });
+
+  describe('provider-wide daily token cap (NavyAI)', () => {
+    const ENV = 'PROVIDER_DAILY_TOKEN_CAP_NAVY';
+    let original: string | undefined;
+    let dbReady = false;
+
+    function ensureDb() {
+      if (dbReady) return;
+      process.env.ENCRYPTION_KEY = '0'.repeat(64);
+      initDb(':memory:');
+      dbReady = true;
+    }
+
+    function seedNavyModel(modelId: string, tpdLimit: number, monthlyTokenBudget: string) {
+      getDb().prepare(`
+        INSERT INTO models (
+          platform, model_id, display_name, intelligence_rank, speed_rank,
+          size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit,
+          monthly_token_budget, context_window, enabled, supports_vision,
+          supports_tools
+        ) VALUES (
+          'navy', ?, ?, 1, 1, 'Large', 20, NULL, NULL, ?,
+          ?, NULL, 1, 0, 1
+        )
+        ON CONFLICT(platform, model_id) DO UPDATE SET
+          tpd_limit = excluded.tpd_limit,
+          monthly_token_budget = excluded.monthly_token_budget
+      `).run(modelId, `${modelId} (NavyAI)`, tpdLimit, monthlyTokenBudget);
+    }
+
+    beforeEach(() => {
+      ensureDb();
+      original = process.env[ENV];
+      getDb().prepare('DELETE FROM rate_limit_usage').run();
+      getDb().prepare("DELETE FROM models WHERE platform = 'navy'").run();
+      delete process.env[ENV];
+    });
+
+    afterEach(() => {
+      if (original === undefined) delete process.env[ENV];
+      else process.env[ENV] = original;
+    });
+
+    it('defaults to NavyAI 150K tokens/day and allows env override / disable', () => {
+      expect(getProviderDailyTokenCap('navy')).toBe(150_000);
+      expect(getProviderDailyTokenCap('groq')).toBeNull();
+      process.env[ENV] = '5000';
+      expect(getProviderDailyTokenCap('navy')).toBe(5000);
+      process.env[ENV] = '0';
+      expect(getProviderDailyTokenCap('navy')).toBeNull();
+    });
+
+    it('counts NavyAI tokens across all models using catalog multiplier hints', () => {
+      seedNavyModel('gpt-5.4', 33_333, '150K/day shared \u00b7 4.5x');
+      seedNavyModel('llama-3.3-70b-instruct', 150_000, '150K/day shared \u00b7 1x');
+
+      recordTokens('navy', 'gpt-5.4', testId, 1000);
+      recordTokens('navy', 'llama-3.3-70b-instruct', testId, 1000);
+
+      expect(providerDailyTokenCount('navy', testId)).toBe(5500);
+    });
+
+    it('blocks the provider key when multiplier-adjusted tokens would exceed the shared cap', () => {
+      process.env[ENV] = '5000';
+      seedNavyModel('gemini-2.5-flash', 75_000, '150K/day shared \u00b7 2x');
+
+      recordTokens('navy', 'gemini-2.5-flash', testId, 2000);
+
+      expect(canUseProviderTokens('navy', testId, 'gemini-2.5-flash', 400)).toBe(true);
+      expect(canUseProviderTokens('navy', testId, 'gemini-2.5-flash', 600)).toBe(false);
+    });
+  });
 });
 
 describe('Cooldown duration with upstream Retry-After', () => {
@@ -269,5 +401,23 @@ describe('parseRetryAfterMs', () => {
     expect(parseRetryAfterMs(null)).toBeUndefined();
     expect(parseRetryAfterMs('')).toBeUndefined();
     expect(parseRetryAfterMs('soon')).toBeUndefined();
+  });
+
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  it('clamps an absurd delta-seconds value to 24h', () => {
+    // Feeds the cooldown expiry directly, so an unclamped value benches the key
+    // effectively forever.
+    expect(parseRetryAfterMs('99999999999')).toBe(DAY_MS);
+    expect(parseRetryAfterMs(String(DAY_MS / 1000 + 1))).toBe(DAY_MS);
+  });
+
+  it('clamps a far-future HTTP-date to 24h', () => {
+    expect(parseRetryAfterMs(new Date(Date.now() + 30 * DAY_MS).toUTCString())).toBe(DAY_MS);
+  });
+
+  it('leaves values at or under 24h untouched', () => {
+    expect(parseRetryAfterMs(String(DAY_MS / 1000))).toBe(DAY_MS);
+    expect(parseRetryAfterMs('3600')).toBe(3_600_000);
   });
 });

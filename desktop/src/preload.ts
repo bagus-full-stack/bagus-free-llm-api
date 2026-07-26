@@ -46,11 +46,24 @@ function reportTheme() {
     document.documentElement.classList.contains('dark') ? 'dark' : 'light',
   );
 }
+
+// Mirror the dashboard's locale to the main process so the native tray menu and
+// the popover match. The I18nProvider sets `<html lang>` on every locale change,
+// so observe that attribute rather than reaching into the dashboard's
+// localStorage from this preload world.
+function reportLocale() {
+  const lang = document.documentElement.lang;
+  if (lang) ipcRenderer.send('freeapi:locale-changed', lang);
+}
 window.addEventListener('DOMContentLoaded', () => {
   applyDesktopClass();
   reportTheme();
-  new MutationObserver(reportTheme).observe(document.documentElement, {
+  reportLocale();
+  new MutationObserver(() => {
+    reportTheme();
+    reportLocale();
+  }).observe(document.documentElement, {
     attributes: true,
-    attributeFilter: ['class'],
+    attributeFilter: ['class', 'lang'],
   });
 });

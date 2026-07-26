@@ -1,11 +1,12 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { app, dialog, ipcMain, clipboard, nativeTheme } from 'electron';
+import { app, dialog, ipcMain, clipboard, nativeTheme, shell } from 'electron';
 import { startServer, ensureSessionToken, getUnifiedApiKey } from './server.mjs';
 import { loadConfig, saveConfig } from './config.js';
-import { buildTray } from './tray.js';
+import { buildTray, refreshTrayLocale } from './tray.js';
 import { openDashboard } from './window.js';
 import { todayStats, hourlyRequests, successRateToday } from './stats.js';
+import { normalizeLocale, nativeStrings, type NativeLocale } from './i18n.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_PORT = 31415;
@@ -30,6 +31,11 @@ if (!app.requestSingleInstanceLock()) {
     ?? loadConfig().theme
     ?? (nativeTheme.shouldUseDarkColors ? 'dark' : 'light');
   nativeTheme.themeSource = theme;
+  // The dashboard also owns the language (its ⋯-menu selector); the native tray
+  // menu and popover follow via the same mirror-and-persist pattern as the theme.
+  let locale: NativeLocale = normalizeLocale(
+    (process.env.FREEAPI_LOCALE as string | undefined) ?? loadConfig().locale,
+  );
 
   app.on('second-instance', () => {
     if (sessionToken) openDashboard(resolvedPort, sessionToken);
@@ -37,6 +43,33 @@ if (!app.requestSingleInstanceLock()) {
 
   // The app lives in the tray; closing the dashboard window must not quit.
   app.on('window-all-closed', () => {});
+
+  // Every window is a view onto the local dashboard, so anything that isn't
+  // the local server belongs in the system browser. Without a window-open
+  // handler, target="_blank" links (e.g. "Get API key" on the Keys page)
+  // spawn a bare child window that inherits our preload and renders blank
+  // (#304) — deny the window and hand the URL to the OS instead. Only
+  // http(s) ever reaches openExternal.
+  const isExternal = (url: string) => {
+    try {
+      const u = new URL(url);
+      return (u.protocol === 'http:' || u.protocol === 'https:') && u.hostname !== '127.0.0.1';
+    } catch {
+      return false;
+    }
+  };
+  app.on('web-contents-created', (_event, contents) => {
+    contents.setWindowOpenHandler(({ url }) => {
+      if (isExternal(url)) shell.openExternal(url);
+      return { action: 'deny' };
+    });
+    contents.on('will-navigate', (event, url) => {
+      if (isExternal(url)) {
+        event.preventDefault();
+        shell.openExternal(url);
+      }
+    });
+  });
 
   // ── popover IPC ──────────────────────────────────────────────────────────
   ipcMain.handle('freeapi:snapshot', () => {
@@ -49,7 +82,12 @@ if (!app.requestSingleInstanceLock()) {
       successRate: successRateToday(),
       hourly: hourlyRequests(),
       loginItem: app.getLoginItemSettings().openAtLogin,
+      version: app.getVersion(),
       theme,
+      locale,
+      // The popover renderer is a file:// page with no access to the desktop
+      // i18n module, so ship it the resolved string bundle for the active locale.
+      strings: nativeStrings(locale),
     };
   });
   ipcMain.on('freeapi:theme-changed', async (_e, next: 'dark' | 'light') => {
@@ -62,11 +100,49 @@ if (!app.requestSingleInstanceLock()) {
     const { getPopoverWindow } = await import('./popover.js');
     getPopoverWindow()?.webContents.send('freeapi:refresh');
   });
+  ipcMain.on('freeapi:locale-changed', async (_e, raw: string) => {
+    const next = normalizeLocale(raw);
+    if (next === locale) return;
+    locale = next;
+    saveConfig({ ...loadConfig(), locale });
+    refreshTrayLocale(locale);
+    // Re-label the popover if it's open (snapshot now carries the new strings).
+    const { getPopoverWindow } = await import('./popover.js');
+    getPopoverWindow()?.webContents.send('freeapi:refresh');
+  });
   ipcMain.handle('freeapi:open-dashboard', () => openDashboard(resolvedPort, sessionToken));
   ipcMain.handle('freeapi:copy-base-url', () => clipboard.writeText(`http://127.0.0.1:${resolvedPort}/v1`));
   ipcMain.handle('freeapi:copy-api-key', () => clipboard.writeText(getUnifiedApiKey()));
   ipcMain.handle('freeapi:set-login-item', (_e, open: boolean) => app.setLoginItemSettings({ openAtLogin: open }));
   ipcMain.handle('freeapi:quit', () => app.quit());
+
+  // Flip the LAN-access flag and relaunch so the server rebinds (127.0.0.1 ↔
+  // 0.0.0.0). Enabling shows a one-time warning: the API becomes reachable by
+  // anything that can route to this machine, guarded only by the unified key.
+  async function toggleLanAccess(): Promise<void> {
+    const current = loadConfig().lanAccess ?? false;
+    const enabling = !current;
+    if (enabling) {
+      const { response } = await dialog.showMessageBox({
+        type: 'warning',
+        buttons: ['Enable LAN access', 'Cancel'],
+        defaultId: 1,
+        cancelId: 1,
+        title: 'Allow LAN access',
+        message: 'Expose FreeLLMAPI to your local network?',
+        detail:
+          'The server will bind to 0.0.0.0 so other devices (Tailscale, VMs, ' +
+          'phones on your Wi-Fi) can reach it at http://<this-machine-ip>:' +
+          `${resolvedPort}/v1.\n\nThe API is protected only by your unified ` +
+          'API key. Only do this on a network you trust. The app will restart ' +
+          'to apply the change.',
+      });
+      if (response !== 0) return;
+    }
+    saveConfig({ ...loadConfig(), lanAccess: enabling });
+    app.relaunch();
+    app.quit();
+  }
 
   app.whenReady().then(async () => {
     if (process.platform === 'darwin') app.dock?.hide();
@@ -81,18 +157,24 @@ if (!app.requestSingleInstanceLock()) {
       ? path.join(process.resourcesPath, 'client-dist')
       : path.join(repoRoot, 'client/dist');
 
+    // LAN access binds the embedded server to 0.0.0.0 so Tailscale / VMs / other
+    // devices can reach it (#442, #418). Off by default — 127.0.0.1 keeps the
+    // API local-only. The bind host is fixed at listen() time, so the tray
+    // toggle persists the flag and relaunches.
+    const host = cfg.lanAccess ? '0.0.0.0' : '127.0.0.1';
+
     try {
       const { port } = await startServer({
         dbPath,
         clientDist,
-        host: '127.0.0.1',
+        host,
         preferredPort: cfg.port ?? DEFAULT_PORT,
       });
       resolvedPort = port;
       saveConfig({ ...cfg, port });
       sessionToken = ensureSessionToken();
-      const tray = buildTray(port, sessionToken);
-      console.log(`[desktop] FreeLLMAPI running on http://127.0.0.1:${port}`);
+      const tray = buildTray(port, sessionToken, () => locale, () => loadConfig().lanAccess ?? false, toggleLanAccess);
+      console.log(`[desktop] FreeLLMAPI running on http://${host}:${port}${cfg.lanAccess ? ' (LAN access enabled)' : ''}`);
 
       // Dev-only UI verification: FREEAPI_SHOT=1 opens the popover and the
       // dashboard, captures both to /tmp, and quits. FREEAPI_SHOT=hold opens

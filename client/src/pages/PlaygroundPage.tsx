@@ -1,10 +1,14 @@
 import { useState, useRef, useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { ChevronRight, CircleAlert } from 'lucide-react'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { ModelCombobox } from '@/components/model-combobox'
+import { buildModelOptions } from '@/lib/model-groups'
 import { PageHeader } from '@/components/page-header'
 import { Markdown } from '@/components/markdown'
+import { CopyButton } from '@/components/copy-button'
+import { useI18n } from '@/i18n'
 
 interface FallbackEntry {
   modelDbId: number
@@ -14,25 +18,119 @@ interface FallbackEntry {
   modelId: string
   displayName: string
   sizeLabel: string
+  intelligenceRank: number
   keyCount: number
 }
 
 interface ChatMessage {
   role: 'user' | 'assistant'
   content: string
+  // Request-level failure rendered as a distinct error bubble, not a fake
+  // assistant reply.
+  isError?: boolean
   meta?: {
     platform?: string
     model?: string
     latency?: number
     fallbackAttempts?: number
+    // Fusion responses: the panel models (with their answers, for the
+    // collapsible trace) and the judge that synthesized them (null when not
+    // synthesized — single survivor / best_of). `fusionStreaming` is true while
+    // panel/judge frames are still arriving.
+    fusionPanel?: FusionPanelEntry[]
+    fusionJudge?: { platform: string; model: string } | null
+    fusionStreaming?: boolean
   }
 }
 
+interface FusionPanelEntry {
+  platform: string
+  model: string
+  status?: 'ok' | 'failed'
+  content?: string
+  error?: string
+}
+
+// Render a fusion panel/judge entry as "platform/model", but avoid doubling
+// the provider when the model id already carries it (e.g. openrouter/owl-alpha,
+// groq/compound) — those would otherwise read "openrouter/openrouter/owl-alpha".
+function fusionRouteLabel(p: { platform: string; model: string }): string {
+  return p.model.startsWith(`${p.platform}/`) ? p.model : `${p.platform}/${p.model}`
+}
+
+// Collapsible, minimal-font trace shown OUTSIDE the main answer bubble: each
+// panel model's raw answer as it streamed in, plus the judge that synthesized
+// the final answer. Default-open so you can watch it work; collapse to tuck away.
+function FusionTrace({ panel, judge, streaming, answerStarted }: {
+  panel: FusionPanelEntry[]
+  judge?: { platform: string; model: string } | null
+  streaming?: boolean
+  answerStarted?: boolean
+}) {
+  const { t } = useI18n()
+  // Open while the panel streams in so you can watch it work; auto-collapse the
+  // moment the final answer STARTS streaming (first token in the bubble), so it
+  // tucks away as the answer takes over — unless the user manually toggled it.
+  const [open, setOpen] = useState(true)
+  const touched = useRef(false)
+  useEffect(() => {
+    if (answerStarted && !touched.current) setOpen(false)
+  }, [answerStarted])
+  return (
+    <div className="w-full text-[10px] leading-snug text-muted-foreground/80">
+      <button
+        type="button"
+        onClick={() => { touched.current = true; setOpen(o => !o) }}
+        className="inline-flex items-center gap-1 font-mono hover:text-foreground transition-colors"
+      >
+        <ChevronRight className={`size-3 transition-transform ${open ? 'rotate-90' : ''}`} />
+        {t('playground.fusionTrace', { count: panel.length })}{streaming ? ' …' : ''}
+      </button>
+      {open && (
+        <div className="mt-1 space-y-2 border-l border-border/60 pl-2.5">
+          {panel.map((p, i) => (
+            <div key={i} className="space-y-0.5">
+              <span className="font-mono font-medium">{fusionRouteLabel(p)}</span>
+              {p.status === 'failed'
+                ? <span className="ml-1.5 text-amber-600 dark:text-amber-400">{t('playground.fusionFailed')}{p.error ? `: ${p.error}` : ''}</span>
+                : p.content
+                  ? <div className="whitespace-pre-wrap opacity-80">{p.content}</div>
+                  : <span className="ml-1.5 opacity-60">…</span>}
+            </div>
+          ))}
+          {judge && (
+            <div className="pt-1.5 border-t border-border/60">
+              <span className="font-mono font-medium">{fusionRouteLabel(judge)}</span>
+              <span className="ml-1.5 opacity-70">{t('playground.fusionJudgeSynth')}</span>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function PlaygroundPage() {
+  const { t } = useI18n()
   const [messages, setMessages] = useState<ChatMessage[]>([])
+  // Optional system prompt for this Playground session. Client-side only:
+  // when set, it's prepended as a `system` message to the request. Persisted
+  // to localStorage so it survives reloads.
+  const [systemPrompt, setSystemPrompt] = useState<string>(
+    () => localStorage.getItem('playground.systemPrompt') ?? '',
+  )
+  const [systemPromptOpen, setSystemPromptOpen] = useState<boolean>(
+    () => !!localStorage.getItem('playground.systemPrompt'),
+  )
+  const updateSystemPrompt = (v: string) => {
+    setSystemPrompt(v)
+    localStorage.setItem('playground.systemPrompt', v)
+  }
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
-  const [selectedModel, setSelectedModel] = useState<string>('auto')
+  const [selectedModel, setSelectedModel] = useState<string>(
+    () => localStorage.getItem('playground.model') ?? 'auto',
+  )
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
 
@@ -46,11 +144,70 @@ export default function PlaygroundPage() {
     queryFn: () => apiFetch('/api/fallback'),
   })
 
+  // Unification is always on now (the on/off toggle was removed), so the picker
+  // always collapses a model's providers into one option.
+  const unifyOn = true
+
   const availableModels = fallbackEntries.filter(e => e.keyCount > 0 && e.enabled)
+  // Collapse the same model from multiple providers into one option (value =
+  // canonical id, which the proxy resolves to the whole group).
+  const modelOptions = buildModelOptions(availableModels, unifyOn)
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
+
+  // Read a fusion SSE stream, updating the assistant message in place as panel
+  // answers + the judge arrive (additive `_fusion` frames) and the final answer
+  // streams as content deltas.
+  const streamFusion = async (stream: ReadableStream<Uint8Array>, baseMessages: ChatMessage[], start: number) => {
+    const reader = stream.getReader()
+    const dec = new TextDecoder()
+    let buf = ''
+    let finalContent = ''
+    const panel: FusionPanelEntry[] = []
+    let judge: { platform: string; model: string } | null = null
+
+    const flush = (streaming: boolean) => {
+      setMessages([...baseMessages, {
+        role: 'assistant',
+        content: finalContent,
+        meta: { latency: Date.now() - start, fusionPanel: [...panel], fusionJudge: judge, fusionStreaming: streaming },
+      }])
+    }
+    flush(true)
+
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += dec.decode(value, { stream: true })
+      const lines = buf.split('\n')
+      buf = lines.pop() ?? ''
+      for (const line of lines) {
+        const tl = line.trim()
+        if (!tl.startsWith('data:')) continue
+        const d = tl.slice(5).trim()
+        if (d === '[DONE]') continue
+        let obj: any
+        try { obj = JSON.parse(d) } catch { continue }
+        if (obj._fusion) {
+          if (obj._fusion.event === 'panel') {
+            panel.push({ platform: obj._fusion.platform, model: obj._fusion.model, status: obj._fusion.status, content: obj._fusion.content, error: obj._fusion.error })
+          } else if (obj._fusion.event === 'judge') {
+            judge = { platform: obj._fusion.platform, model: obj._fusion.model }
+          }
+          flush(true)
+        } else if (obj.error) {
+          finalContent = `${t('playground.errorPrefix')} ${obj.error.message}`
+          flush(true)
+        } else if (obj.choices) {
+          const delta = obj.choices[0]?.delta?.content
+          if (delta) { finalContent += delta; flush(true) }
+        }
+      }
+    }
+    flush(false)
+  }
 
   const handleSend = async () => {
     const text = input.trim()
@@ -67,10 +224,18 @@ export default function PlaygroundPage() {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' }
       if (keyData?.apiKey) headers['Authorization'] = `Bearer ${keyData.apiKey}`
 
+      const isFusion = selectedModel === 'fusion'
+      const sysPrompt = systemPrompt.trim()
       const body: any = {
-        messages: newMessages.map(m => ({ role: m.role, content: m.content })),
+        messages: [
+          ...(sysPrompt ? [{ role: 'system', content: sysPrompt }] : []),
+          ...newMessages.map(m => ({ role: m.role, content: m.content })),
+        ],
       }
       if (selectedModel !== 'auto') body.model = selectedModel
+      // Fusion streams its panel + judge trace; ask for a stream so the
+      // Playground can show the other models arriving before the final answer.
+      if (isFusion) body.stream = true
 
       const base = import.meta.env.BASE_URL.replace(/\/$/, '')
       const start = Date.now()
@@ -88,8 +253,14 @@ export default function PlaygroundPage() {
         const err = await res.json().catch(() => ({ error: { message: `HTTP ${res.status}` } }))
         setMessages([...newMessages, {
           role: 'assistant',
-          content: `Error: ${err.error?.message ?? 'Unknown error'}`,
+          isError: true,
+          content: err.error?.message ?? t('common.unknownError'),
         }])
+        return
+      }
+
+      if (isFusion && res.body) {
+        await streamFusion(res.body, newMessages, start)
         return
       }
 
@@ -100,6 +271,13 @@ export default function PlaygroundPage() {
         model: routedVia.split('/').slice(1).join('/'),
       } : undefined)
 
+      // Fusion responses carry a structured routing summary so we can show the
+      // panel models that replied + the judge, rather than parsing the compact
+      // X-Routed-Via string.
+      const fusion = data._fusion as
+        | { panel: { platform: string; model: string }[]; judge: { platform: string; model: string } | null }
+        | undefined
+
       setMessages([...newMessages, {
         role: 'assistant',
         content,
@@ -108,12 +286,15 @@ export default function PlaygroundPage() {
           model: via?.model,
           latency,
           fallbackAttempts: fallbackAttempts ? parseInt(fallbackAttempts) : undefined,
+          fusionPanel: fusion?.panel,
+          fusionJudge: fusion?.judge,
         },
       }])
     } catch (err: any) {
       setMessages([...newMessages, {
         role: 'assistant',
-        content: `Error: ${err.message}`,
+        isError: true,
+        content: err.message,
       }])
     } finally {
       setLoading(false)
@@ -133,36 +314,64 @@ export default function PlaygroundPage() {
     inputRef.current?.focus()
   }
 
+  // Searchable picker options: auto + fusion pinned at the top, then every model
+  // ordered BY INTELLIGENCE — size tier first (Frontier→Small), then the catalog
+  // rank within the tier, name as the final tiebreaker. (Raw intelligence_rank is
+  // per-provider, not global, so tier-first matches the server's preset; #135.)
+  const pickerOptions = [
+    { value: 'auto', label: t('playground.autoModel'), sub: '', isNew: false, platforms: [] as string[] },
+    { value: 'fusion', label: t('playground.fusionModel'), sub: '', isNew: true, platforms: [] as string[] },
+    ...modelOptions
+      .slice()
+      .sort((a, b) =>
+        a.sizeTier - b.sizeTier ||
+        a.intelligenceRank - b.intelligenceRank ||
+        a.label.localeCompare(b.label, undefined, { sensitivity: 'base' }))
+      .map(o => ({
+        value: o.value,
+        label: o.label,
+        sub: o.providerCount > 1 ? t('models.providerCount', { count: o.providerCount }) : o.platform,
+        isNew: false,
+        // Provider names for the multi-provider hover + search; empty when solo.
+        platforms: o.providerCount > 1 ? o.platforms : [],
+      })),
+  ]
+  function pickModel(v: string) {
+    setSelectedModel(v)
+    localStorage.setItem('playground.model', v)
+  }
+
   const activeModelLabel = selectedModel === 'auto'
-    ? 'Auto (fallback chain)'
-    : availableModels.find(m => m.modelId === selectedModel)?.displayName ?? selectedModel
+    ? t('playground.autoModel')
+    : selectedModel === 'fusion'
+    ? t('playground.fusionModel')
+    : modelOptions.find(o => o.value === selectedModel)?.label ?? selectedModel
 
   return (
     <div className="flex flex-col h-[calc(100vh-8rem)]">
       <PageHeader
-        title="Playground"
-        description="Send a chat completion through the router and see which provider serves it."
+        title={t('playground.title')}
+        description={t('playground.description')}
         actions={
           <>
-            <Select value={selectedModel} onValueChange={(v) => setSelectedModel(v ?? 'auto')}>
-              <SelectTrigger className="w-[260px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="auto">Auto (fallback chain)</SelectItem>
-                {availableModels.map(m => (
-                  <SelectItem key={m.modelDbId} value={m.modelId}>
-                    <span className="flex items-center gap-2">
-                      <span>{m.displayName}</span>
-                      <span className="text-xs text-muted-foreground">{m.platform}</span>
-                    </span>
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <ModelCombobox
+              value={selectedModel}
+              options={pickerOptions}
+              onSelect={pickModel}
+              ariaLabel={t('playground.selectModel')}
+              placeholder={t('playground.searchModels')}
+              emptyText={t('playground.noModelsFound')}
+              footer={
+                availableModels.length === 0 ? (
+                  // Models only appear once a platform has an enabled key. Without
+                  // one, the list is just Auto/Fusion and looks broken — say why. (#269)
+                  <div className="px-2 py-1.5 text-xs text-muted-foreground">{t('playground.noModels')}</div>
+                ) : undefined
+              }
+            />
             {messages.length > 0 && (
               <Button variant="outline" size="sm" onClick={handleClear}>
-                Clear
+                {t('playground.clear')}
               </Button>
             )}
           </>
@@ -174,42 +383,98 @@ export default function PlaygroundPage() {
           {messages.length === 0 ? (
             <div className="flex items-center justify-center h-full text-center">
               <div className="space-y-2 max-w-sm">
-                <p className="text-base font-medium">Send a message to get started.</p>
+                <p className="text-base font-medium">{t('playground.emptyTitle')}</p>
                 <p className="text-sm text-muted-foreground">
-                  Using <span className="text-foreground">{activeModelLabel}</span>. Switch models in the selector above.
+                  {t('playground.emptyDescription', { model: activeModelLabel })}
                 </p>
               </div>
             </div>
           ) : (
             <>
-              {messages.map((msg, i) => (
-                <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                  <div
-                    className={`max-w-[78%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
-                      msg.role === 'user'
-                        ? 'bg-primary text-primary-foreground'
-                        : 'bg-muted'
-                    }`}
-                  >
-                    {msg.role === 'assistant' ? (
-                      <Markdown>{msg.content}</Markdown>
-                    ) : (
-                      <div className="whitespace-pre-wrap">{msg.content}</div>
-                    )}
-                    {msg.meta && (
-                      <div className="flex items-center gap-2 mt-2 flex-wrap text-[11px] opacity-70 tabular-nums">
-                        {msg.meta.platform && <span>{msg.meta.platform}</span>}
-                        {msg.meta.model && <span className="font-mono">· {msg.meta.model}</span>}
-                        {msg.meta.latency != null && <span>· {msg.meta.latency} ms</span>}
-                        {msg.meta.fallbackAttempts != null && msg.meta.fallbackAttempts > 0 && (
-                          <span>· {msg.meta.fallbackAttempts} fallback{msg.meta.fallbackAttempts > 1 ? 's' : ''}</span>
-                        )}
-                      </div>
-                    )}
+              {messages.map((msg, i) => {
+                const fusionPanel = msg.meta?.fusionPanel
+                const okPanel = fusionPanel?.filter(p => p.status !== 'failed') ?? []
+                // Skip an empty assistant bubble while the fusion trace is still
+                // streaming in (no final answer yet) — the trace shows below.
+                const showBubble = msg.role === 'user' || msg.content.length > 0
+                return (
+                  <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                    <div className={`flex flex-col gap-1 max-w-[80%] ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
+                      {showBubble && (
+                        <div
+                          className={`group relative rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
+                            msg.role === 'user'
+                              ? 'bg-primary text-primary-foreground'
+                              : msg.isError
+                                ? 'border border-destructive/25 bg-destructive/10 text-destructive'
+                                : 'bg-muted'
+                          }`}
+                        >
+                          {msg.isError ? (
+                            <div className="flex items-start gap-2">
+                              <CircleAlert className="mt-0.5 size-4 shrink-0" />
+                              <div className="min-w-0">
+                                <p className="font-medium">{t('playground.errorTitle')}</p>
+                                <p className="whitespace-pre-wrap break-words">{msg.content}</p>
+                              </div>
+                            </div>
+                          ) : msg.role === 'assistant' ? (
+                            <Markdown>{msg.content}</Markdown>
+                          ) : (
+                            <div className="whitespace-pre-wrap">{msg.content}</div>
+                          )}
+                          {msg.role === 'assistant' && !msg.isError && msg.content && (
+                            <CopyButton
+                              text={msg.content}
+                              label={t('playground.copyReply')}
+                              className="absolute right-1.5 top-1.5 size-6 opacity-0 transition-opacity focus-visible:opacity-100 group-hover:opacity-100"
+                            />
+                          )}
+                          {msg.meta && (
+                            <div className="flex items-center gap-2 mt-2 flex-wrap text-[11px] opacity-70 tabular-nums">
+                              {(fusionPanel || msg.meta.fusionStreaming) ? (
+                                <>
+                                  {okPanel.length > 0 && (
+                                    <span>
+                                      {t('playground.fusionPanel')}:{' '}
+                                      <span className="font-mono">{okPanel.map(fusionRouteLabel).join(', ')}</span>
+                                    </span>
+                                  )}
+                                  {msg.meta.fusionJudge && (
+                                    <span>
+                                      · {t('playground.fusionJudge')}:{' '}
+                                      <span className="font-mono">{fusionRouteLabel(msg.meta.fusionJudge)}</span>
+                                    </span>
+                                  )}
+                                  {msg.meta.latency != null && <span>· {msg.meta.latency} ms</span>}
+                                </>
+                              ) : (
+                                <>
+                                  {msg.meta.platform && <span>{msg.meta.platform}</span>}
+                                  {msg.meta.model && <span className="font-mono">· {msg.meta.model}</span>}
+                                  {msg.meta.latency != null && <span>· {msg.meta.latency} ms</span>}
+                                  {msg.meta.fallbackAttempts != null && msg.meta.fallbackAttempts > 0 && (
+                                    <span>· {msg.meta.fallbackAttempts} {msg.meta.fallbackAttempts > 1 ? t('playground.fallbacks') : t('playground.fallback')}</span>
+                                  )}
+                                </>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      {msg.role === 'assistant' && fusionPanel && fusionPanel.length > 0 && (
+                        <FusionTrace
+                          panel={fusionPanel}
+                          judge={msg.meta?.fusionJudge}
+                          streaming={msg.meta?.fusionStreaming}
+                          answerStarted={msg.content.length > 0}
+                        />
+                      )}
+                    </div>
                   </div>
-                </div>
-              ))}
-              {loading && (
+                )
+              })}
+              {loading && !messages[messages.length - 1]?.meta?.fusionStreaming && (
                 <div className="flex justify-start">
                   <div className="bg-muted rounded-2xl px-4 py-3">
                     <div className="flex gap-1">
@@ -226,13 +491,33 @@ export default function PlaygroundPage() {
         </div>
 
         <div className="border-t bg-background/50 p-3">
+          <div className="mb-2">
+            <button
+              type="button"
+              onClick={() => setSystemPromptOpen(o => !o)}
+              className="flex items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+            >
+              <ChevronRight className={`size-3.5 transition-transform ${systemPromptOpen ? 'rotate-90' : ''}`} />
+              {t('playground.systemPromptLabel')}
+              {systemPrompt.trim() && <span className="ml-1 size-1.5 rounded-full bg-primary/70" />}
+            </button>
+            {systemPromptOpen && (
+              <textarea
+                value={systemPrompt}
+                onChange={e => updateSystemPrompt(e.target.value)}
+                placeholder={t('playground.systemPromptPlaceholder')}
+                rows={2}
+                className="mt-1.5 w-full resize-y rounded-lg border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring/50 min-h-[44px] max-h-[160px]"
+              />
+            )}
+          </div>
           <div className="flex gap-2 items-end">
             <textarea
               ref={inputRef}
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="Type a message… (⏎ to send, ⇧⏎ for newline)"
+              placeholder={t('playground.inputPlaceholder')}
               rows={1}
               className="flex-1 resize-none rounded-lg border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring/50 min-h-[40px] max-h-[160px]"
               style={{ height: 'auto', overflow: 'hidden' }}
@@ -243,7 +528,7 @@ export default function PlaygroundPage() {
               }}
             />
             <Button onClick={handleSend} disabled={loading || !input.trim()} size="default">
-              {loading ? 'Sending…' : 'Send'}
+              {loading ? t('playground.sending') : t('playground.send')}
             </Button>
           </div>
         </div>

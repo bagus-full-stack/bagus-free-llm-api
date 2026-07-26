@@ -7,6 +7,9 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
+import { FieldError } from '@/components/ui/field-error'
+import { CardSkeleton } from '@/components/ui/skeleton'
+import { useI18n } from '@/i18n'
 
 interface LicenseStatus {
   valid: boolean
@@ -34,13 +37,8 @@ interface PremiumStatus {
   siteUrl: string
 }
 
-const PLAN_LABEL: Record<string, string> = {
-  annual: 'Premium Annual',
-  lifetime: 'Premium Lifetime',
-}
-
-function fmtWhen(ms: number | null): string {
-  if (!ms) return 'never'
+function fmtWhen(ms: number | null): string | null {
+  if (!ms) return null
   return new Date(ms).toLocaleString()
 }
 
@@ -50,8 +48,10 @@ function fmtDate(iso: string | null): string {
 }
 
 export default function PremiumPage() {
+  const { t } = useI18n()
   const queryClient = useQueryClient()
   const [keyInput, setKeyInput] = useState('')
+  const [activateAttempted, setActivateAttempted] = useState(false)
 
   const isDev = import.meta.env.DEV
 
@@ -67,6 +67,7 @@ export default function PremiumPage() {
   }
 
   const activate = useMutation({
+    meta: { silenceToast: true },
     mutationFn: (key: string) =>
       apiFetch('/api/premium/key', { method: 'POST', body: JSON.stringify({ key }) }),
     onSuccess: () => {
@@ -86,6 +87,7 @@ export default function PremiumPage() {
   })
 
   const openPortal = useMutation({
+    meta: { silenceToast: true },
     mutationFn: () => apiFetch<{ url: string }>('/api/premium/portal', { method: 'POST' }),
     onSuccess: ({ url }) => {
       window.open(url, '_blank', 'noopener')
@@ -100,8 +102,11 @@ export default function PremiumPage() {
   if (isLoading || !data) {
     return (
       <div>
-        <PageHeader title="Premium" description="The live model catalog, on every device." />
-        <p className="text-sm text-muted-foreground">Loading…</p>
+        <PageHeader title={t('premium.title')} description={t('premium.description')} />
+        <div className="space-y-6">
+          <CardSkeleton />
+          <CardSkeleton />
+        </div>
       </div>
     )
   }
@@ -113,12 +118,12 @@ export default function PremiumPage() {
   return (
     <div>
       <PageHeader
-        title="Premium"
-        description="The live model catalog, on every device."
+        title={t('premium.title')}
+        description={t('premium.description')}
         actions={
           <Button variant="outline" size="sm" onClick={() => syncNow.mutate()} disabled={syncNow.isPending}>
             <RefreshCw className={syncNow.isPending ? 'animate-spin' : ''} />
-            {syncNow.isPending ? 'Syncing…' : 'Check for updates'}
+            {syncNow.isPending ? t('premium.syncing') : t('premium.checkForUpdates')}
           </Button>
         }
       />
@@ -126,61 +131,65 @@ export default function PremiumPage() {
       <div className="space-y-8">
         {/* Catalog feed state */}
         <section>
-          <h2 className="text-sm font-medium mb-3">Catalog feed</h2>
+          <h2 className="text-sm font-medium mb-3">{t('premium.catalogFeed')}</h2>
           <div className="rounded-3xl border bg-card p-5">
             <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
               <div className="flex items-center gap-2">
                 <span className={`inline-block size-2 rounded-full ${live ? 'bg-emerald-500' : 'bg-muted-foreground/40'}`} />
-                <span className="text-sm font-medium">{live ? 'Live feed' : 'Monthly snapshot'}</span>
+                <span className="text-sm font-medium">{live ? t('premium.liveFeed') : t('premium.monthlySnapshot')}</span>
                 <Badge variant="outline" className="font-mono text-[11px]">
-                  {catalog.appliedVersion ?? 'bundled'}
+                  {catalog.appliedVersion ?? t('premium.bundled')}
                 </Badge>
               </div>
-              <span className="text-xs text-muted-foreground">Last checked: {fmtWhen(catalog.lastSyncMs)}</span>
+              <span className="text-xs text-muted-foreground">{t('premium.lastChecked', { when: fmtWhen(catalog.lastSyncMs) ?? t('common.never') })}</span>
             </div>
             <p className="text-xs text-muted-foreground mt-3">
               {live
-                ? 'New free models, quota changes, and quirk fixes land here within hours of being shipped. The app checks automatically twice a day; nothing to do.'
-                : 'Free tier: the catalog refreshes from a monthly snapshot, checked automatically twice a day. Premium switches this to the live feed, updated every 2-3 days.'}
+                ? t('premium.liveDescription')
+                : t('premium.snapshotDescription')}
             </p>
             {catalog.lastError && (
-              <p className="text-destructive text-xs mt-2">Last sync problem: {catalog.lastError}</p>
+              <p className="text-destructive text-xs mt-2">{t('premium.lastSyncProblem', { error: catalog.lastError })}</p>
             )}
           </div>
         </section>
 
         {/* License */}
         <section>
-          <h2 className="text-sm font-medium mb-3">License</h2>
+          <h2 className="text-sm font-medium mb-3">{t('premium.license')}</h2>
           {hasKey ? (
             <div className="rounded-3xl border bg-card p-5 space-y-4">
               <div className="flex flex-wrap items-center gap-3">
                 <span className="font-mono text-sm">{maskedKey}</span>
                 {licensed ? (
                   <Badge className="bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-transparent">
-                    {PLAN_LABEL[license?.plan ?? ''] ?? 'Premium'}
+                    {license?.plan === 'annual'
+                      ? t('premium.planAnnual')
+                      : license?.plan === 'lifetime'
+                        ? t('premium.planLifetime')
+                        : t('premium.planGeneric')}
                   </Badge>
                 ) : (
                   <Badge variant="outline" className="text-destructive border-destructive/40">
-                    {license?.reason === 'expired' ? 'Expired' : 'Inactive'}
+                    {license?.reason === 'expired' ? t('premium.expired') : t('premium.inactive')}
                   </Badge>
                 )}
               </div>
 
               <p className="text-xs text-muted-foreground">
-                {licensed && license?.plan === 'lifetime' && 'Lifetime license: never expires.'}
+                {licensed && license?.plan === 'lifetime' && t('premium.lifetimeNote')}
                 {licensed && license?.plan === 'annual' && !license.cancelAtPeriodEnd && license.expiresAt &&
-                  `Renews on ${fmtDate(license.expiresAt)}.`}
+                  t('premium.renewsOn', { date: fmtDate(license.expiresAt) })}
                 {licensed && license?.plan === 'annual' && license.cancelAtPeriodEnd && license.expiresAt &&
-                  `Will not renew. Premium until ${fmtDate(license.expiresAt)}, then this install falls back to the free monthly catalog.`}
+                  t('premium.willNotRenew', { date: fmtDate(license.expiresAt) })}
                 {!licensed &&
-                  'This key is no longer active. The app keeps working on the free monthly catalog.'}
+                  t('premium.keyInactive')}
               </p>
 
               <div className="flex flex-wrap items-center gap-2">
                 <Button variant="outline" size="sm" onClick={() => openPortal.mutate()} disabled={openPortal.isPending}>
                   <ExternalLink />
-                  {openPortal.isPending ? 'Opening…' : 'Manage subscription'}
+                  {openPortal.isPending ? t('premium.openingPortal') : t('premium.manageSubscription')}
                 </Button>
                 <Button
                   variant="ghost"
@@ -189,12 +198,11 @@ export default function PremiumPage() {
                   disabled={removeKey.isPending}
                   className="text-muted-foreground"
                 >
-                  Remove key from this device
+                  {t('premium.removeKey')}
                 </Button>
               </div>
               <p className="text-[11px] text-muted-foreground">
-                Manage subscription opens Stripe&apos;s billing portal: cancel, update your card, or download
-                invoices. Removing the key only deactivates this device; your purchase is untouched.
+                {t('premium.manageHint')}
               </p>
               {openPortal.isError && (
                 <p className="text-destructive text-xs">{(openPortal.error as Error).message}</p>
@@ -206,30 +214,37 @@ export default function PremiumPage() {
                 className="flex flex-wrap items-end gap-3"
                 onSubmit={(e) => {
                   e.preventDefault()
-                  if (keyInput.trim()) activate.mutate(keyInput.trim())
+                  if (!keyInput.trim()) {
+                    setActivateAttempted(true)
+                    return
+                  }
+                  setActivateAttempted(false)
+                  activate.mutate(keyInput.trim())
                 }}
               >
                 <div className="space-y-1.5 flex-1 min-w-[260px]">
-                  <Label className="text-xs">License key</Label>
+                  <Label className="text-xs">{t('premium.licenseKey')}</Label>
                   <Input
                     value={keyInput}
                     onChange={(e) => setKeyInput(e.target.value)}
                     placeholder="fla_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
                     className="font-mono text-xs"
                     autoComplete="off"
+                    aria-invalid={activateAttempted && !keyInput.trim()}
                   />
+                  {activateAttempted && !keyInput.trim() && <FieldError error={t('validation.required')} />}
                 </div>
-                <Button type="submit" size="sm" disabled={!keyInput.trim() || activate.isPending}>
-                  {activate.isPending ? 'Activating…' : 'Activate'}
+                <Button type="submit" size="sm" disabled={activate.isPending}>
+                  {activate.isPending ? t('premium.activating') : t('premium.activate')}
                 </Button>
               </form>
               {activate.isError && (
                 <p className="text-destructive text-xs">{(activate.error as Error).message}</p>
               )}
               <p className="text-xs text-muted-foreground">
-                Your key is in your purchase email and on the post-checkout page. Lost it?{' '}
+                {t('premium.keyHint')}{' '}
                 <a className="underline hover:text-foreground" href={`${siteUrl}/manage.html`} target="_blank" rel="noopener noreferrer">
-                  Recover it on the website
+                  {t('premium.recoverKey')}
                 </a>
                 .
               </p>
@@ -244,10 +259,9 @@ export default function PremiumPage() {
               <div className="flex items-start gap-3">
                 <Sparkles className="size-4 mt-0.5 text-muted-foreground" />
                 <div>
-                  <p className="text-sm font-medium">Go live for $19 a year</p>
+                  <p className="text-sm font-medium">{t('premium.upsellTitle')}</p>
                   <p className="text-xs text-muted-foreground mt-0.5">
-                    New free models the moment they exist, instead of on the 1st of the month. One key, every
-                    device. Cancel anytime; the router stays free forever.
+                    {t('premium.upsellDescription')}
                   </p>
                 </div>
               </div>
@@ -258,7 +272,7 @@ export default function PremiumPage() {
                 className="shrink-0"
               >
                 <Button size="sm">
-                  Go Premium
+                  {t('premium.goPremium')}
                   <ExternalLink />
                 </Button>
               </a>

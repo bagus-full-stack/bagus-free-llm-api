@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { OpenAICompatProvider } from '../../providers/openai-compat.js';
 
 describe('OpenAICompatProvider', () => {
@@ -12,6 +12,27 @@ describe('OpenAICompatProvider', () => {
       extraHeaders: { 'X-Custom': 'test' },
     });
   });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function sseResponse(frames: string[]): any {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const encoder = new TextEncoder();
+        for (const frame of frames) controller.enqueue(encoder.encode(frame));
+        controller.close();
+      },
+    });
+    return { ok: true, body: stream, headers: new Headers() };
+  }
+
+  async function collect<T>(gen: AsyncGenerator<T>): Promise<T[]> {
+    const out: T[] = [];
+    for await (const chunk of gen) out.push(chunk);
+    return out;
+  }
 
   it('should set platform and name from config', () => {
     expect(provider.platform).toBe('groq');
@@ -46,6 +67,57 @@ describe('OpenAICompatProvider', () => {
     expect(capturedHeaders['Authorization']).toBe('Bearer my-key');
     expect(capturedHeaders['X-Custom']).toBe('test');
     expect(capturedBody.messages[0].role).toBe('user');
+  });
+
+  it('uses a 60s chat timeout by default for OpenAI-compatible providers (#530)', async () => {
+    const delays: number[] = [];
+    const origSetTimeout = global.setTimeout;
+    vi.spyOn(global, 'setTimeout').mockImplementation(((fn: () => void, ms?: number) => {
+      delays.push(ms ?? 0);
+      return origSetTimeout(fn, ms);
+    }) as typeof setTimeout);
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({
+        id: 'test-id',
+        object: 'chat.completion',
+        created: 123,
+        model: 'test-model',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    } as any);
+
+    await provider.chatCompletion('my-key', [{ role: 'user', content: 'test' }], 'test-model');
+
+    expect(delays).toContain(60_000);
+    expect(delays).not.toContain(15_000);
+  });
+
+  it('honors CompletionOptions.timeoutMs for OpenAI-compatible streams (#530)', async () => {
+    const delays: number[] = [];
+    const origSetTimeout = global.setTimeout;
+    vi.spyOn(global, 'setTimeout').mockImplementation(((fn: () => void, ms?: number) => {
+      delays.push(ms ?? 0);
+      return origSetTimeout(fn, ms);
+    }) as typeof setTimeout);
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(sseResponse([
+      'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}\n\n',
+      'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+      'data: [DONE]\n\n',
+    ]));
+
+    const chunks = await collect(provider.streamChatCompletion(
+      'my-key',
+      [{ role: 'user', content: 'test' }],
+      'test-model',
+      { timeoutMs: 12_345 },
+    ));
+
+    expect(chunks.length).toBeGreaterThan(0);
+    expect(delays).toContain(12_345);
+    expect(delays).not.toContain(60_000);
+    expect(delays).not.toContain(15_000);
   });
 
   it('should pass tool-calling params through untouched', async () => {
@@ -159,14 +231,105 @@ describe('OpenAICompatProvider', () => {
     ).rejects.toThrow(/not OpenAI-compatible/);
   });
 
+  it('distinguishes a truncated 200 body (CDN keepalive) from a wrong-endpoint 200 body (#430)', async () => {
+    // Cloudflare-fronted free-tier upstreams (Kilo routing Nemotron / Poolside Laguna)
+    // deliver a partial JSON body when the 600s edge idle-keepalive fires mid-response.
+    // Node's JSON.parse surfaces that as "Unexpected end of JSON input" — different from
+    // the NDJSON / native-API case above. Operators were chasing a base-URL bug that
+    // didn't exist because both paths produced the same error string.
+    const headers = new Headers({ 'content-type': 'application/json' });
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers,
+      json: () => Promise.reject(new SyntaxError('Unexpected end of JSON input')),
+    } as any);
+
+    let caught: Error | null = null;
+    try {
+      await provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model');
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).not.toBeNull();
+    expect(caught!.message).toMatch(/truncated mid-stream/);
+    expect(caught!.message).toMatch(/Cloudflare's 600s edge limit/);
+    expect(caught!.message).not.toMatch(/not OpenAI-compatible/);
+  });
+
+  it('attributes an "after JSON at position" parse error with Content-Type: application/json to CDN truncation (#430)', async () => {
+    // Same edge-keepalive case but the body parses far enough to reach a
+    // mid-token garbage character before EOF. Content-Type is the only signal
+    // that distinguishes this from a real NDJSON upstream (next test).
+    const headers = new Headers({ 'content-type': 'application/json' });
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers,
+      json: () => Promise.reject(new SyntaxError('Unexpected non-whitespace character after JSON at position 4096 (line 1 column 4097)')),
+    } as any);
+
+    await expect(
+      provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model')
+    ).rejects.toThrow(/truncated mid-stream/);
+  });
+
+  it('does not flag NDJSON Content-Type as a truncation (#430 regression guard)', async () => {
+    // A real Ollama-style upstream announces NDJSON via Content-Type. Even if
+    // the parse error message happens to match the "after JSON at position"
+    // substring (NDJSON bodies do — the parser eats one object, then trips
+    // on the next one), we must not misclassify it as a CDN truncation.
+    const headers = new Headers({ 'content-type': 'application/x-ndjson' });
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers,
+      json: () => Promise.reject(new SyntaxError('Unexpected non-whitespace character after JSON at position 120 (line 3 column 1)')),
+    } as any);
+
+    await expect(
+      provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model')
+    ).rejects.toThrow(/not OpenAI-compatible/);
+  });
+
+  it('does not classify NDJSON Content-Type as a truncation — explicit not.toThrow (#430)', async () => {
+    // Companion to the previous test: explicitly assert the truncation message
+    // does NOT appear, so a future refactor can't silently switch the branch.
+    const headers = new Headers({ 'content-type': 'application/x-ndjson' });
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers,
+      json: () => Promise.reject(new SyntaxError('Unexpected non-whitespace character after JSON at position 120 (line 3 column 1)')),
+    } as any);
+
+    let caught: Error | null = null;
+    try {
+      await provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model');
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).not.toBeNull();
+    expect(caught!.message).not.toMatch(/truncated mid-stream/);
+    expect(caught!.message).toMatch(/not OpenAI-compatible/);
+  });
+
   it('should validate key using models endpoint', async () => {
     vi.spyOn(global, 'fetch').mockResolvedValueOnce({ ok: true, status: 200 } as any);
     expect(await provider.validateKey('valid')).toBe(true);
   });
 
-  it('validateKey returns false on confirmed 401', async () => {
-    vi.spyOn(global, 'fetch').mockResolvedValueOnce({ ok: false, status: 401 } as any);
-    expect(await provider.validateKey('bad')).toBe(false);
+  it('validateKey preserves the provider reason on confirmed 401', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: false,
+      status: 401,
+      statusText: 'Unauthorized',
+      json: () => Promise.resolve({ error: { message: 'This token has expired' } }),
+    } as any);
+    expect(await provider.validateKey('bad')).toEqual({
+      valid: false,
+      error: 'TestProvider key validation failed (HTTP 401): This token has expired',
+    });
   });
 
   it('validateKey propagates transport errors instead of swallowing', async () => {
@@ -208,6 +371,46 @@ describe('OpenAICompatProvider', () => {
 
     const result = await provider.chatCompletion('k', [{ role: 'user', content: 'hi' }], 'm');
     expect(result.choices[0].message.content).toBe('part one part two');
+  });
+
+  it('strips internal reasoning/thought fields before sending messages to Mistral (#530)', async () => {
+    let body: any = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      body = JSON.parse((init as any).body);
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          id: 'id', object: 'chat.completion', created: 1, model: 'm',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      } as any;
+    });
+
+    const mistral = new OpenAICompatProvider({ platform: 'mistral', name: 'Mistral', baseUrl: 'https://api.mistral.ai/v1' });
+    await mistral.chatCompletion(
+      'k',
+      [{
+        role: 'assistant',
+        content: null,
+        reasoning_content: 'private chain',
+        tool_calls: [{
+          id: 'call_1',
+          type: 'function',
+          function: { name: 'lookup', arguments: '{}' },
+          thought_signature: 'google-private-signature',
+        }],
+      }],
+      'mistral-medium-3',
+    );
+
+    expect(body.messages[0]).not.toHaveProperty('reasoning_content');
+    expect(body.messages[0].tool_calls[0]).not.toHaveProperty('thought_signature');
+    expect(body.messages[0].tool_calls[0]).toEqual({
+      id: 'call_1',
+      type: 'function',
+      function: { name: 'lookup', arguments: '{}' },
+    });
   });
 
   it('folds reasoning into content when content is empty (Ollama style — bare `reasoning` field)', async () => {
@@ -299,8 +502,14 @@ describe('OpenAICompatProvider - platform instances', () => {
     { platform: 'mistral',    name: 'Mistral',       baseUrl: 'https://api.mistral.ai/v1' },
     { platform: 'openrouter', name: 'OpenRouter',    baseUrl: 'https://openrouter.ai/api/v1' },
     { platform: 'github',     name: 'GitHub Models', baseUrl: 'https://models.github.ai/inference' },
+    { platform: 'pollinations', name: 'Pollinations', baseUrl: 'https://gen.pollinations.ai/v1' },
     { platform: 'zhipu',      name: 'Zhipu AI',      baseUrl: 'https://open.bigmodel.cn/api/paas/v4' },
     { platform: 'opencode',   name: 'OpenCode Zen',  baseUrl: 'https://opencode.ai/zen/v1' },
+    { platform: 'aion',       name: 'Aion Labs',     baseUrl: 'https://api.aionlabs.ai/v1' },
+    { platform: 'requesty',   name: 'Requesty',      baseUrl: 'https://router.requesty.ai/v1' },
+    { platform: 'navy',       name: 'NavyAI',        baseUrl: 'https://api.navy/v1' },
+    { platform: 'nara',       name: 'NaraRouter',    baseUrl: 'https://router.bynara.id/v1' },
+    { platform: 'sealion',    name: 'SEA-LION',      baseUrl: 'https://api.sea-lion.ai/v1' },
   ] as const;
 
   for (const p of platforms) {
@@ -325,4 +534,306 @@ describe('OpenAICompatProvider - platform instances', () => {
       expect(result._routed_via?.platform).toBe(p.platform);
     });
   }
+
+  it('omits greedy temperature=0 for Requesty Leanstral and supplies neutral top_p', async () => {
+    const provider = new OpenAICompatProvider({
+      platform: 'requesty',
+      name: 'Requesty',
+      baseUrl: 'https://router.requesty.ai/v1',
+    });
+    let body: Record<string, unknown> = {};
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      body = JSON.parse(String((init as RequestInit).body));
+      return {
+        ok: true,
+        headers: new Headers(),
+        json: () => Promise.resolve({
+          id: 'id', object: 'chat.completion', created: 1, model: 'mistral/leanstral-1-5',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      } as any;
+    });
+
+    await provider.chatCompletion(
+      'key',
+      [{ role: 'user', content: 'hi' }],
+      'mistral/leanstral-1-5',
+      { temperature: 0 },
+    );
+
+    expect(body.temperature).toBeUndefined();
+    expect(body.top_p).toBe(1);
+  });
+
+  // #264: Groq (and others) reject a model's inline tool-call dialect with a 400
+  // `tool_use_failed`, handing back the raw text in `error.failed_generation`.
+  // We rescue it into structured tool_calls instead of dead-ending the turn.
+  describe('tool_use_failed rescue (#264)', () => {
+    let provider: OpenAICompatProvider;
+    beforeEach(() => {
+      provider = new OpenAICompatProvider({ platform: 'groq', name: 'Groq', baseUrl: 'https://api.groq.com/openai/v1' });
+    });
+    const tools = [{
+      type: 'function' as const,
+      function: { name: 'read', description: 'read a file', parameters: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } },
+    }];
+    const failBody = {
+      error: {
+        message: 'Failed to call a function. Please adjust your prompt. See \'failed_generation\' for more details.',
+        type: 'invalid_request_error',
+        code: 'tool_use_failed',
+        failed_generation: '<function=read={"file_path": "sample.txt"}</function>',
+      },
+    };
+
+    it('non-stream: rescues failed_generation into structured tool_calls', async () => {
+      vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+        ok: false, status: 400, statusText: 'Bad Request',
+        json: () => Promise.resolve(failBody),
+      } as any);
+
+      const r = await provider.chatCompletion('key', [{ role: 'user', content: 'read sample.txt' }], 'llama-3.3-70b-versatile', { tools, tool_choice: 'auto' });
+      expect(r.choices[0].finish_reason).toBe('tool_calls');
+      const tc = r.choices[0].message.tool_calls;
+      expect(tc?.length).toBe(1);
+      expect(tc![0].function.name).toBe('read');
+      expect(JSON.parse(tc![0].function.arguments)).toEqual({ file_path: 'sample.txt' });
+    });
+
+    it('stream: yields a synthesized tool_calls turn instead of throwing', async () => {
+      vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+        ok: false, status: 400, statusText: 'Bad Request',
+        json: () => Promise.resolve(failBody),
+      } as any);
+
+      const chunks: any[] = [];
+      for await (const c of provider.streamChatCompletion('key', [{ role: 'user', content: 'read sample.txt' }], 'llama-3.3-70b-versatile', { tools, tool_choice: 'auto' })) {
+        chunks.push(c);
+      }
+      const calls = chunks.flatMap(c => c.choices[0].delta.tool_calls ?? []);
+      expect(calls.length).toBe(1);
+      expect(calls[0].function.name).toBe('read');
+      expect(chunks.some(c => c.choices[0].finish_reason === 'tool_calls')).toBe(true);
+    });
+
+    it('still throws when there is no failed_generation to rescue', async () => {
+      vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+        ok: false, status: 400, statusText: 'Bad Request',
+        json: () => Promise.resolve({ error: { message: 'bad request', code: 'invalid_request' } }),
+      } as any);
+      await expect(
+        provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'm', { tools }),
+      ).rejects.toThrow(/API error 400/);
+    });
+  });
+});
+
+describe('extended sampling param passthrough', () => {
+  const mockOk = () => ({
+    ok: true,
+    json: () => Promise.resolve({
+      id: 'x', object: 'chat.completion', created: 1, model: 'm',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    }),
+  }) as any;
+
+  const extended = {
+    seed: 42, top_k: 40, min_p: 0.05, presence_penalty: 0.5, frequency_penalty: -0.25,
+    logit_bias: { '50256': -100 }, logprobs: true, top_logprobs: 3,
+    response_format: { type: 'json_schema' as const, json_schema: { name: 'a', schema: { type: 'object' } } },
+  };
+
+  it('forwards the full extended set for a policy-free platform', async () => {
+    let body: any = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      body = JSON.parse((init as any).body);
+      return mockOk();
+    });
+    const p = new OpenAICompatProvider({ platform: 'cerebras', name: 'T', baseUrl: 'https://x/v1' });
+    await p.chatCompletion('k', [{ role: 'user', content: 'q' }], 'm', extended);
+
+    expect(body.seed).toBe(42);
+    expect(body.top_k).toBe(40);
+    expect(body.min_p).toBe(0.05);
+    expect(body.logit_bias).toEqual({ '50256': -100 });
+    expect(body.logprobs).toBe(true);
+    expect(body.top_logprobs).toBe(3);
+    expect(body.response_format.type).toBe('json_schema');
+  });
+
+  it('applies the mistral policy on the wire: random_seed rename, strict-API params dropped', async () => {
+    let body: any = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      body = JSON.parse((init as any).body);
+      return mockOk();
+    });
+    const p = new OpenAICompatProvider({ platform: 'mistral', name: 'T', baseUrl: 'https://x/v1' });
+    await p.chatCompletion('k', [{ role: 'user', content: 'q' }], 'm', extended);
+
+    expect(body.random_seed).toBe(42);
+    expect(body).not.toHaveProperty('seed');
+    expect(body).not.toHaveProperty('top_k');
+    expect(body).not.toHaveProperty('logit_bias');
+    expect(body).not.toHaveProperty('logprobs');
+    expect(body.presence_penalty).toBe(0.5);
+    expect(body.response_format.type).toBe('json_schema');
+  });
+
+  it('sends no extended keys when none were requested (undefined stays omitted)', async () => {
+    let raw = '';
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      raw = (init as any).body;
+      return mockOk();
+    });
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    await p.chatCompletion('k', [{ role: 'user', content: 'q' }], 'm', { temperature: 0.7 });
+
+    expect(raw).not.toContain('seed');
+    expect(raw).not.toContain('response_format');
+    expect(raw).not.toContain('logit_bias');
+  });
+});
+
+describe('reasoning: request knob + <think> extraction (P2 #16)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const mockOk = (content: string, extra: Record<string, unknown> = {}) => ({
+    ok: true,
+    json: () => Promise.resolve({
+      id: 'x', object: 'chat.completion', created: 1, model: 'm',
+      choices: [{ index: 0, message: { role: 'assistant', content, ...extra }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    }),
+  }) as any;
+
+  function sse(frames: string[]): any {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const encoder = new TextEncoder();
+        for (const f of frames) controller.enqueue(encoder.encode(f));
+        controller.close();
+      },
+    });
+    return { ok: true, body: stream, headers: new Headers() };
+  }
+
+  async function collect<T>(g: AsyncGenerator<T>): Promise<T[]> {
+    const out: T[] = [];
+    for await (const c of g) out.push(c);
+    return out;
+  }
+
+  const dataFrame = (delta: Record<string, unknown>, finish: string | null = null) =>
+    `data: ${JSON.stringify({ id: 's1', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+
+  it('forwards reasoning_effort on the wire for a supporting platform', async () => {
+    let body: any = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      body = JSON.parse((init as any).body);
+      return mockOk('hi');
+    });
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    await p.chatCompletion('k', [{ role: 'user', content: 'q' }], 'm', { reasoning_effort: 'low' });
+    expect(body.reasoning_effort).toBe('low');
+  });
+
+  it('strips reasoning_effort for a platform whose policy drops it (mistral)', async () => {
+    let body: any = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      body = JSON.parse((init as any).body);
+      return mockOk('hi');
+    });
+    const p = new OpenAICompatProvider({ platform: 'mistral', name: 'T', baseUrl: 'https://x/v1' });
+    await p.chatCompletion('k', [{ role: 'user', content: 'q' }], 'm', { reasoning_effort: 'high' });
+    expect(body).not.toHaveProperty('reasoning_effort');
+  });
+
+  it('sends nothing reasoning-related when the knob is absent (default unchanged)', async () => {
+    let raw = '';
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      raw = (init as any).body;
+      return mockOk('hi');
+    });
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    await p.chatCompletion('k', [{ role: 'user', content: 'q' }], 'm', { temperature: 0 });
+    expect(raw).not.toContain('reasoning');
+  });
+
+  it('non-streaming: a leading <think> block moves into reasoning_content', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => mockOk('<think>chain of thought</think>The answer is 4.'));
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    const res = await p.chatCompletion('k', [{ role: 'user', content: '2+2?' }], 'm');
+    const msg = res.choices[0].message as any;
+    expect(msg.content).toBe('The answer is 4.');
+    expect(msg.reasoning_content).toBe('chain of thought');
+  });
+
+  it('non-streaming: a think-only message still folds back into content (never empty)', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => mockOk('<think>all reasoning, no answer</think>'));
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    const res = await p.chatCompletion('k', [{ role: 'user', content: 'q' }], 'm');
+    const msg = res.choices[0].message as any;
+    expect(msg.content).toBe('all reasoning, no answer');
+    expect(msg.reasoning_content).toBe('all reasoning, no answer');
+  });
+
+  it('non-streaming: tag-free content is untouched', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => mockOk('plain answer'));
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    const res = await p.chatCompletion('k', [{ role: 'user', content: 'q' }], 'm');
+    const msg = res.choices[0].message as any;
+    expect(msg.content).toBe('plain answer');
+    expect(msg.reasoning_content).toBeUndefined();
+  });
+
+  it('streaming: think content becomes delta.reasoning_content even when the tags split across chunks', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => sse([
+      dataFrame({ role: 'assistant' }),
+      dataFrame({ content: '<thi' }),
+      dataFrame({ content: 'nk>step one, ' }),
+      dataFrame({ content: 'step two</th' }),
+      dataFrame({ content: 'ink>Final answer' }),
+      dataFrame({}, 'stop'),
+      'data: [DONE]\n\n',
+    ]));
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    const chunks = await collect(p.streamChatCompletion('k', [{ role: 'user', content: 'q' }], 'm'));
+    const reasoning = chunks.map(c => (c.choices?.[0]?.delta as any)?.reasoning_content ?? '').join('');
+    const content = chunks.map(c => c.choices?.[0]?.delta?.content ?? '').join('');
+    expect(reasoning).toBe('step one, step two');
+    expect(content).toBe('Final answer');
+  });
+
+  it('streaming: an unclosed <think> at stream end flushes as reasoning, losing no text', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => sse([
+      dataFrame({ content: '<think>truncated thought</thi' }),
+      dataFrame({}, 'length'),
+      'data: [DONE]\n\n',
+    ]));
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    const chunks = await collect(p.streamChatCompletion('k', [{ role: 'user', content: 'q' }], 'm'));
+    const reasoning = chunks.map(c => (c.choices?.[0]?.delta as any)?.reasoning_content ?? '').join('');
+    const content = chunks.map(c => c.choices?.[0]?.delta?.content ?? '').join('');
+    expect(reasoning).toBe('truncated thought</thi');
+    expect(content).toBe('');
+  });
+
+  it('streaming: a tag-free stream is byte-identical (no synthetic frames, no reasoning)', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => sse([
+      dataFrame({ role: 'assistant' }),
+      dataFrame({ content: 'Hello ' }),
+      dataFrame({ content: 'world' }),
+      dataFrame({}, 'stop'),
+      'data: [DONE]\n\n',
+    ]));
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    const chunks = await collect(p.streamChatCompletion('k', [{ role: 'user', content: 'q' }], 'm'));
+    expect(chunks).toHaveLength(4);
+    expect(chunks.map(c => c.choices?.[0]?.delta?.content ?? '').join('')).toBe('Hello world');
+    expect(chunks.some(c => (c.choices?.[0]?.delta as any)?.reasoning_content != null)).toBe(false);
+  });
 });
